@@ -4,8 +4,11 @@ FROM rust:1.75 as builder
 WORKDIR /app
 
 # Copy manifest files
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 COPY src ./src
+
+# Cargo.lock will be generated automatically during build if it doesn't exist
+# For reproducible builds, you can generate it first with: cargo generate-lockfile
 
 # Build the server binary
 RUN cargo build --release --bin server
