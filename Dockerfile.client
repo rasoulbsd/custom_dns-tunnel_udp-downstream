@@ -1,0 +1,37 @@
+# Multi-stage build for DNS Tunnel Client
+FROM rust:1.75 as builder
+
+WORKDIR /app
+
+# Copy manifest files
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+# Build the client binary
+RUN cargo build --release --bin client
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the binary from builder
+COPY --from=builder /app/target/release/client /app/client
+
+# Create config directory
+RUN mkdir -p /app/config
+
+# Expose local UDP port (default 5355)
+EXPOSE 5355/udp
+
+# Run as non-root
+USER 1000:1000
+
+ENTRYPOINT ["/app/client"]
+CMD ["--config", "/app/config/client-config.json"]

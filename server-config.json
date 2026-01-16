@@ -1,0 +1,11 @@
+{
+  "dns_bind": "0.0.0.0:5353",
+  "target_udp": "127.0.0.1:8080",
+  "client_udp_port": 5355,
+  "domains": [
+    "example.com",
+    "tunnel.example.com"
+  ],
+  "max_subdomain_length": 64,
+  "randomize_dns_port": false
+}

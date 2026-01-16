@@ -1,0 +1,36 @@
+# Multi-stage build for DNS Tunnel Server
+FROM rust:1.75 as builder
+
+WORKDIR /app
+
+# Copy manifest files
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+# Build the server binary
+RUN cargo build --release --bin server
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the binary from builder
+COPY --from=builder /app/target/release/server /app/server
+
+# Create config directory
+RUN mkdir -p /app/config
+
+# Expose DNS port (53) - requires privileged mode or NET_ADMIN capability
+EXPOSE 53/udp
+
+# Run as non-root by default (but port 53 requires root or capabilities)
+USER 1000:1000
+
+ENTRYPOINT ["/app/server"]
+CMD ["--config", "/app/config/server-config.json"]

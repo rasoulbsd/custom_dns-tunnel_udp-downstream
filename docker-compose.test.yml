@@ -1,0 +1,45 @@
+version: '3.8'
+
+# Test docker-compose for local testing with echo server
+
+services:
+  echo-server:
+    image: alpine:latest
+    container_name: dns-tunnel-echo
+    command: sh -c "apk add --no-cache netcat-openbsd && nc -l -u -p 8080 -e cat"
+    network_mode: host
+    ports:
+      - "8080:8080/udp"
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: dns-tunnel-server
+    image: dns-tunnel:server
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./server-config.json:/app/config/server-config.json:ro
+      - ./logs/server:/app/logs
+    environment:
+      - RUST_LOG=info
+    privileged: true
+    depends_on:
+      - echo-server
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: dns-tunnel-client
+    image: dns-tunnel:client
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./client-config.json:/app/config/client-config.json:ro
+      - ./logs/client:/app/logs
+    environment:
+      - RUST_LOG=info
+    depends_on:
+      - server

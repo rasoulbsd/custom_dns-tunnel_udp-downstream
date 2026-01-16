@@ -1,0 +1,17 @@
+# Example override file for custom configurations
+# Copy this to docker-compose.override.yml and modify as needed
+
+version: '3.8'
+
+services:
+  server:
+    environment:
+      - RUST_LOG=debug  # Change log level
+    # volumes:
+    #   - ./custom-server-config.json:/app/config/server-config.json:ro
+
+  client:
+    environment:
+      - RUST_LOG=debug  # Change log level
+    # volumes:
+    #   - ./custom-client-config.json:/app/config/client-config.json:ro

@@ -1,0 +1,39 @@
+version: '3.8'
+
+# Production docker-compose for separate servers
+# Use this on the VPS (server) and client (Iran) separately
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: dns-tunnel-server
+    image: dns-tunnel:server
+    restart: unless-stopped
+    network_mode: host  # Required for DNS port 53
+    volumes:
+      - ./server-config-prod.json:/app/config/server-config.json:ro
+      - ./logs/server:/app/logs
+    environment:
+      - RUST_LOG=info
+    privileged: true
+    # Or use capabilities:
+    # cap_add:
+    #   - NET_ADMIN
+    #   - NET_RAW
+    #   - NET_BIND_SERVICE
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: dns-tunnel-client
+    image: dns-tunnel:client
+    restart: unless-stopped
+    network_mode: host  # Required for local UDP and DNS queries
+    volumes:
+      - ./client-config-prod.json:/app/config/client-config.json:ro
+      - ./logs/client:/app/logs
+    environment:
+      - RUST_LOG=info

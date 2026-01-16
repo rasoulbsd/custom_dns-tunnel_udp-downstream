@@ -1,0 +1,18 @@
+target/
+.git/
+.gitignore
+*.md
+*.log
+logs/
+*.sh
+*.bat
+.env
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Keep config files for volume mounting
+!*-config.json
+!*-config-prod.json
