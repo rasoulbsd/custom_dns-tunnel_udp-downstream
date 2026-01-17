@@ -1,5 +1,27 @@
 # Docker Deployment Guide
 
+## Prerequisites
+
+Before deploying, ensure your VPS has the required dependencies installed. See [VPS_SETUP.md](./VPS_SETUP.md) for complete installation instructions.
+
+### Quick Dependency Install
+
+**Essential packages:**
+- Docker Engine
+- Docker Compose
+- Git
+- UFW (firewall)
+
+**Installation:**
+```bash
+# See VPS_SETUP.md for complete script
+# Or install manually:
+sudo apt-get update
+sudo apt-get install -y docker.io docker-compose git ufw
+sudo usermod -aG docker $USER
+# Log out and back in
+```
+
 ## Quick Start
 
 ### Local Testing (Single Machine)

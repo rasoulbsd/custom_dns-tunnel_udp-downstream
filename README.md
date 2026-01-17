@@ -36,10 +36,27 @@ A hybrid DNS/UDP tunneling implementation in Rust that allows UDP traffic to be 
 
 ## Installation
 
+### Option 1: Docker (Recommended for Production)
+
+See [DOCKER_GUIDE.md](./DOCKER_GUIDE.md) for Docker deployment instructions.
+
+**VPS Dependencies:**
+- Docker Engine
+- Docker Compose
+- Git
+- UFW (firewall)
+
+See [VPS_SETUP.md](./VPS_SETUP.md) for complete VPS setup instructions.
+
+### Option 2: Native Build
+
 ```bash
 # Clone the repository
 git clone <repository-url>
 cd dns-tunnel
+
+# Install Rust (if not already installed)
+curl https://sh.rustup.rs -sSf | sh
 
 # Build the project
 cargo build --release

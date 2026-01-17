@@ -34,7 +34,7 @@ struct Args {
     client_udp_port: Option<u16>,
     #[arg(short, long)]
     domains: Vec<String>,
-    #[arg(long, default_value = "64")]
+    #[arg(long, default_value = "63")]
     max_subdomain_length: usize,
     #[arg(long)]
     randomize_dns_port: bool,

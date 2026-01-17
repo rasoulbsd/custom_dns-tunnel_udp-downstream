@@ -32,7 +32,7 @@ struct Args {
     domains: Vec<String>,
     #[arg(short, long)]
     resolvers: Vec<String>,
-    #[arg(long, default_value = "64")]
+    #[arg(long, default_value = "63")]
     max_subdomain_length: usize,
     #[arg(long)]
     no_rotate_resolvers: bool,
@@ -69,17 +69,33 @@ async fn main() -> Result<()> {
     config.rotate_resolvers = !args.no_rotate_resolvers;
     config.randomize_local_port = args.randomize_local_port;
 
-    // Set local UDP port
-    let local_port = if config.randomize_local_port {
-        get_random_port()
+    // Set local UDP address and port
+    // Use config's local_udp if no CLI args provided, otherwise use CLI args
+    // Check if user provided CLI args (not just defaults)
+    let local_udp: SocketAddr = if args.local_port.is_some() {
+        // User provided port via CLI, use CLI args
+        let local_port = if config.randomize_local_port {
+            get_random_port()
+        } else {
+            args.local_port.unwrap_or_else(|| {
+                config.local_udp.port()
+            })
+        };
+        format!("{}:{}", args.local_addr, local_port)
+            .parse()
+            .context("Invalid local UDP address")?
     } else {
-        args.local_port.unwrap_or_else(|| {
-            config.local_udp.port()
-        })
+        // No CLI port provided, use config's local_udp (respects 0.0.0.0 if set in config)
+        if config.randomize_local_port {
+            let port = get_random_port();
+            format!("{}:{}", config.local_udp.ip(), port)
+                .parse()
+                .context("Invalid local UDP address")?
+        } else {
+            // Use config's address and port directly (this respects 0.0.0.0 from config)
+            config.local_udp
+        }
     };
-    let local_udp: SocketAddr = format!("{}:{}", args.local_addr, local_port)
-        .parse()
-        .context("Invalid local UDP address")?;
 
     info!("Starting DNS Tunnel Client");
     info!("Local UDP: {}", local_udp);

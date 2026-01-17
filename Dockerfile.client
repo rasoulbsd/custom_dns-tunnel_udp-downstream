@@ -1,5 +1,24 @@
 # Multi-stage build for DNS Tunnel Client
-FROM rust:1.75 as builder
+FROM debian:bookworm-slim as builder
+
+# Install dependencies for building Rust
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    build-essential \
+    gcc \
+    libc6-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust using rustup (non-interactive)
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable && \
+    chmod -R a+w $RUSTUP_HOME $CARGO_HOME
 
 WORKDIR /app
 

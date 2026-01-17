@@ -13,8 +13,13 @@ pub struct DnsCodec {
 
 impl DnsCodec {
     pub fn new(max_subdomain_length: usize) -> Self {
+        // DNS label limit is 63 bytes (RFC 1035)
+        // Cap at 63 to ensure DNS compatibility
+        let max_subdomain_length = max_subdomain_length.min(63);
+        
         // Reserve space for domain name, hex encoding doubles the size
         // Hex encoding: 1 byte = 2 hex characters
+        // Ensure we use even number of hex chars (truncate to even if needed)
         let max_payload = (max_subdomain_length / 2).max(16);
         
         Self {
@@ -43,9 +48,17 @@ impl DnsCodec {
         let encoded = hex::encode(&packet_data);
         
         // Ensure subdomain doesn't exceed max length
-        let subdomain = if encoded.len() > self.max_subdomain_length {
-            &encoded[..self.max_subdomain_length]
+        // DNS label limit is 63 bytes (RFC 1035)
+        // Hex encoding always produces even length (1 byte = 2 hex chars)
+        // But we need to ensure truncation is to even length if needed
+        let max_len = self.max_subdomain_length.min(63); // Cap at DNS limit
+        let subdomain = if encoded.len() > max_len {
+            // Truncate to even length to avoid "odd number of digits" error
+            // Round down to nearest even number
+            let truncate_len = (max_len / 2) * 2;
+            &encoded[..truncate_len]
         } else {
+            // hex::encode always produces even length, so no need to truncate
             &encoded
         };
 
@@ -112,8 +125,19 @@ impl DnsCodec {
 
         // Decode hex (case insensitive - convert to lowercase)
         let subdomain_lower = subdomain_part.to_lowercase();
-        let decoded = hex::decode(&subdomain_lower)
-            .map_err(|e| anyhow!("Failed to decode hex: {}", e))?;
+        
+        // Handle odd-length hex strings (shouldn't happen, but be defensive)
+        let hex_to_decode = if subdomain_lower.len() % 2 == 1 {
+            // Odd length - pad with '0' at the end (or truncate last char)
+            // Truncating is safer as padding might decode to wrong value
+            log::warn!("Odd-length hex string detected, truncating last character: {}", subdomain_lower);
+            &subdomain_lower[..subdomain_lower.len() - 1]
+        } else {
+            &subdomain_lower
+        };
+        
+        let decoded = hex::decode(hex_to_decode)
+            .map_err(|e| anyhow!("Failed to decode hex: {} (hex: {})", e, hex_to_decode))?;
 
         if decoded.len() < 4 {
             return Err(anyhow!("Packet too short"));

@@ -12,7 +12,7 @@ pub struct ClientConfig {
     pub domains: Vec<String>,
     /// List of DNS resolver addresses
     pub resolvers: Vec<SocketAddr>,
-    /// Maximum subdomain length (default: 64)
+    /// Maximum subdomain length (default: 63, max: 63 due to DNS label limit)
     pub max_subdomain_length: usize,
     /// Enable resolver rotation
     pub rotate_resolvers: bool,
@@ -27,7 +27,7 @@ impl Default for ClientConfig {
             response_udp_port: None,
             domains: vec!["example.com".to_string()],
             resolvers: vec!["8.8.8.8:53".parse().unwrap()],
-            max_subdomain_length: 64,
+            max_subdomain_length: 63,
             rotate_resolvers: true,
             randomize_local_port: false,
         }
@@ -44,7 +44,7 @@ pub struct ServerConfig {
     pub client_udp_port: Option<u16>,
     /// List of domains to listen for
     pub domains: Vec<String>,
-    /// Maximum subdomain length (default: 64)
+    /// Maximum subdomain length (default: 63, max: 63 due to DNS label limit)
     pub max_subdomain_length: usize,
     /// Randomize DNS server port
     pub randomize_dns_port: bool,
@@ -57,7 +57,7 @@ impl Default for ServerConfig {
             target_udp: None,
             client_udp_port: Some(5353),
             domains: vec!["example.com".to_string()],
-            max_subdomain_length: 64,
+            max_subdomain_length: 63,
             randomize_dns_port: false,
         }
     }
