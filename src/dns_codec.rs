@@ -17,10 +17,23 @@ impl DnsCodec {
         // Cap at 63 to ensure DNS compatibility
         let max_subdomain_length = max_subdomain_length.min(63);
         
-        // Reserve space for domain name, hex encoding doubles the size
-        // Hex encoding: 1 byte = 2 hex characters
-        // Ensure we use even number of hex chars (truncate to even if needed)
-        let max_payload = (max_subdomain_length / 2).max(16);
+        // Calculate max payload per query
+        // We need to account for:
+        // 1. 4-byte header (packet_id: 2 bytes + fragment_id: 1 byte + total_fragments: 1 byte)
+        // 2. Hex encoding doubles the size (1 byte = 2 hex chars)
+        // 3. Max subdomain length is 63 chars
+        // Formula: (payload + header) * 2 <= max_subdomain_length
+        //          (payload + 4) * 2 <= 63
+        //          payload + 4 <= 31
+        //          payload <= 27
+        // To ensure even hex length: 27 bytes payload = 54 hex chars, + 8 hex chars header = 62 hex chars (fits in 63)
+        let max_total_bytes = max_subdomain_length / 2; // Max bytes that fit in subdomain (63/2 = 31)
+        let header_size = 4; // packet_id (2) + fragment_id (1) + total_fragments (1)
+        let max_payload = if max_total_bytes > header_size {
+            max_total_bytes - header_size // 31 - 4 = 27 bytes
+        } else {
+            0
+        }.max(16); // Minimum 16 bytes
         
         Self {
             max_subdomain_length,
@@ -109,56 +122,55 @@ impl DnsCodec {
         }
 
         // Extract subdomain (everything before the domain)
+        // Find the longest matching domain to handle cases like "tunnel.example.com" vs "example.com"
         let domain = expected_domains.iter()
-            .find(|d| query_name.ends_with(&format!(".{}", d)) || query_name == d.as_str())
+            .filter(|d| {
+                let domain_with_dot = format!(".{}", d);
+                query_name.ends_with(&domain_with_dot) || query_name == d.as_str()
+            })
+            .max_by_key(|d| d.len())
             .ok_or_else(|| anyhow!("Domain not found"))?;
         
-        // Extract subdomain part
+        // Extract subdomain part - remove the domain suffix
         let subdomain_part = if query_name == domain.as_str() {
             // No subdomain, just the domain
             return Err(anyhow!("Query has no subdomain"));
         } else {
-            // Remove .domain suffix
-            query_name.strip_suffix(&format!(".{}", domain))
-                .ok_or_else(|| anyhow!("Invalid query format"))?
+            // Remove .domain suffix (with dot) - this is the most common case
+            if let Some(stripped) = query_name.strip_suffix(&format!(".{}", domain)) {
+                // Check if there are any remaining dots (shouldn't be, subdomain should be pure hex)
+                if stripped.contains('.') {
+                    // If there are dots, we might have matched the wrong domain
+                    // Try to extract by finding the last dot before the domain
+                    // For "subdomain.tunnel.example.com" with domain "tunnel.example.com"
+                    // We want "subdomain", not "subdomain.tunnel"
+                    if let Some(last_dot) = stripped.rfind('.') {
+                        // Take everything after the last dot as the actual subdomain
+                        &stripped[last_dot + 1..]
+                    } else {
+                        stripped
+                    }
+                } else {
+                    stripped
+                }
+            } else if query_name.ends_with(domain) {
+                // Handle case where domain doesn't have leading dot in query (unlikely but possible)
+                let potential = &query_name[..query_name.len() - domain.len()];
+                // Remove leading dot if present
+                potential.strip_prefix('.').unwrap_or(potential)
+            } else {
+                return Err(anyhow!("Invalid query format: cannot extract subdomain from '{}' with domain '{}'", query_name, domain));
+            }
         };
-
-        // Decode hex (case insensitive - convert to lowercase)
-        let subdomain_lower = subdomain_part.to_lowercase();
         
-        // Handle odd-length hex strings (shouldn't happen, but be defensive)
-        let hex_to_decode = if subdomain_lower.len() % 2 == 1 {
-            // Odd length - pad with '0' at the end (or truncate last char)
-            // Truncating is safer as padding might decode to wrong value
-            log::warn!("Odd-length hex string detected, truncating last character: {}", subdomain_lower);
-            &subdomain_lower[..subdomain_lower.len() - 1]
-        } else {
-            &subdomain_lower
-        };
-        
-        let decoded = hex::decode(hex_to_decode)
-            .map_err(|e| anyhow!("Failed to decode hex: {} (hex: {})", e, hex_to_decode))?;
-
-        if decoded.len() < 4 {
-            return Err(anyhow!("Packet too short"));
+        // Final validation: subdomain should be pure hex (no dots, no other chars)
+        if subdomain_part.contains('.') {
+            return Err(anyhow!("Subdomain contains dots after extraction: '{}' (query: '{}', domain: '{}')", 
+                              subdomain_part, query_name, domain));
         }
 
-        // Extract packet metadata
-        let packet_id = u16::from_be_bytes([decoded[0], decoded[1]]);
-        let fragment_id = decoded[2];
-        let total_fragments = decoded[3];
-        let data = decoded[4..].to_vec();
-
-        // We don't have source/dest in DNS query, so we'll use placeholder
-        // The actual source will be set by the server based on the DNS query source
-        Ok(Some(TunnelPacket {
-            data,
-            source: "0.0.0.0:0".parse().unwrap(), // Will be set by server
-            destination: "0.0.0.0:0".parse().unwrap(), // Will be set by server
-            packet_id,
-            fragment_id,
-            total_fragments,
-        }))
+        // Decode the subdomain
+        self.decode_subdomain(subdomain_part)
     }
 
     /// Encode UDP packet data for direct UDP transmission (not DNS)
@@ -220,5 +232,50 @@ impl DnsCodec {
 
     pub fn max_payload_per_query(&self) -> usize {
         self.max_payload_per_query
+    }
+    
+    /// Decode a hex subdomain string into a TunnelPacket
+    fn decode_subdomain(&self, subdomain_part: &str) -> Result<Option<TunnelPacket>> {
+        // Decode hex (case insensitive - convert to lowercase)
+        let subdomain_lower = subdomain_part.to_lowercase();
+        
+        // Ensure we have a valid hex string (only 0-9, a-f)
+        if !subdomain_lower.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(anyhow!("Subdomain contains non-hex characters: {}", subdomain_lower));
+        }
+        
+        // Handle odd-length hex strings (shouldn't happen if encoding is correct, but be defensive)
+        let hex_to_decode = if subdomain_lower.len() % 2 == 1 {
+            // Odd length - truncate last char (safer than padding which might decode to wrong value)
+            log::warn!("Odd-length hex string detected, truncating last character: {} (len: {})", 
+                      subdomain_lower, subdomain_lower.len());
+            &subdomain_lower[..subdomain_lower.len() - 1]
+        } else {
+            &subdomain_lower
+        };
+        
+        let decoded = hex::decode(hex_to_decode)
+            .map_err(|e| anyhow!("Failed to decode hex: {} (hex: {}, len: {})", e, hex_to_decode, hex_to_decode.len()))?;
+
+        if decoded.len() < 4 {
+            return Err(anyhow!("Packet too short (decoded: {} bytes)", decoded.len()));
+        }
+
+        // Extract packet metadata
+        let packet_id = u16::from_be_bytes([decoded[0], decoded[1]]);
+        let fragment_id = decoded[2];
+        let total_fragments = decoded[3];
+        let data = decoded[4..].to_vec();
+
+        // We don't have source/dest in DNS query, so we'll use placeholder
+        // The actual source will be set by the server based on the DNS query source
+        Ok(Some(TunnelPacket {
+            data,
+            source: "0.0.0.0:0".parse().unwrap(), // Will be set by server
+            destination: "0.0.0.0:0".parse().unwrap(), // Will be set by server
+            packet_id,
+            fragment_id,
+            total_fragments,
+        }))
     }
 }

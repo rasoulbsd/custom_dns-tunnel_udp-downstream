@@ -5,7 +5,7 @@
     "tunnel.example.com"
   ],
   "resolvers": [
-    "127.0.0.1:5353"
+    "127.0.0.1:53533"
   ],
   "max_subdomain_length": 64,
   "rotate_resolvers": true,

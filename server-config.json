@@ -1,5 +1,5 @@
 {
-  "dns_bind": "0.0.0.0:5353",
+  "dns_bind": "0.0.0.0:53533",
   "target_udp": "127.0.0.1:8080",
   "client_udp_port": 5355,
   "domains": [
