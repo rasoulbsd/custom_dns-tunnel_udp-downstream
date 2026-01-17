@@ -64,7 +64,7 @@ impl TcpPacket {
     /// Deserialize TCP packet from bytes
     pub fn deserialize(data: &[u8]) -> anyhow::Result<Self> {
         if data.len() < 11 {
-            return Err(anyhow::anyhow!("Packet too short"));
+            return Err(anyhow::anyhow!("Packet too short: {} bytes (need at least 11)", data.len()));
         }
 
         let connection_id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
@@ -72,8 +72,19 @@ impl TcpPacket {
         let data_length = u16::from_be_bytes([data[8], data[9]]);
         let flags = data[10];
         
-        if data.len() < 11 + data_length as usize {
-            return Err(anyhow::anyhow!("Packet data incomplete"));
+        log::debug!("Deserializing TCP packet: connection_id={}, sequence={}, data_length={}, flags={}, total_len={}", 
+                   connection_id, sequence, data_length, flags, data.len());
+        
+        let expected_len = 11 + data_length as usize;
+        if data.len() < expected_len {
+            log::error!("TCP packet deserialization failed: have {} bytes, need {} bytes (data_length={}), connection_id={}, sequence={}", 
+                       data.len(), expected_len, data_length, connection_id, sequence);
+            return Err(anyhow::anyhow!(
+                "Packet data incomplete: have {} bytes, need {} bytes (data_length={})",
+                data.len(),
+                expected_len,
+                data_length
+            ));
         }
 
         let packet_data = data[11..11 + data_length as usize].to_vec();

@@ -109,8 +109,10 @@ impl DnsCodec {
         }
 
         // Extract subdomain (everything before the domain)
+        // Match longest domain first to avoid partial matches (e.g., tunnel.example.com vs example.com)
         let domain = expected_domains.iter()
-            .find(|d| query_name.ends_with(&format!(".{}", d)) || query_name == d.as_str())
+            .filter(|d| query_name.ends_with(&format!(".{}", d)) || query_name == d.as_str())
+            .max_by_key(|d| d.len())
             .ok_or_else(|| anyhow!("Domain not found"))?;
         
         // Extract subdomain part
@@ -118,9 +120,14 @@ impl DnsCodec {
             // No subdomain, just the domain
             return Err(anyhow!("Query has no subdomain"));
         } else {
-            // Remove .domain suffix
-            query_name.strip_suffix(&format!(".{}", domain))
-                .ok_or_else(|| anyhow!("Invalid query format"))?
+            // Remove .domain suffix (try both with and without leading dot)
+            if let Some(part) = query_name.strip_suffix(&format!(".{}", domain)) {
+                part
+            } else if let Some(part) = query_name.strip_suffix(domain) {
+                part
+            } else {
+                return Err(anyhow!("Invalid query format: cannot extract subdomain from '{}'", query_name));
+            }
         };
 
         // Decode hex (case insensitive - convert to lowercase)

@@ -378,11 +378,12 @@ async fn main() -> Result<()> {
 
                                     // Check if this is a TCP packet
                                     if PacketReassembler::is_tcp_packet(&reassembled_data) {
+                                        info!("Detected TCP packet ({} bytes), extracting...", reassembled_data.len());
                                         // Handle TCP packet
                                         match extract_tcp_packet(&reassembled_data) {
                                             Ok(tcp_packet) => {
-                                                debug!("Received TCP packet: connection_id={}, sequence={}, flags={}", 
-                                                       tcp_packet.connection_id, tcp_packet.sequence, tcp_packet.flags);
+                                                info!("Received TCP packet: connection_id={}, sequence={}, flags={}, data_length={}, actual_data_len={}", 
+                                                       tcp_packet.connection_id, tcp_packet.sequence, tcp_packet.flags, tcp_packet.data_length, tcp_packet.data.len());
                                                 
                                                 let client_udp_addr = {
                                                     let client_udp_port = config.client_udp_port.unwrap_or(5353);
@@ -474,19 +475,25 @@ async fn main() -> Result<()> {
                                                     }
                                                 } else if has_data {
                                                     // Data packet: write to TCP stream
+                                                    info!("Received TCP data packet: connection_id={}, data_len={}", 
+                                                          tcp_packet.connection_id, tcp_packet.data.len());
                                                     let streams = tcp_streams.lock().await;
                                                     if let Some(stream) = streams.get(&tcp_packet.connection_id) {
                                                         let mut stream_guard = stream.lock().await;
                                                         if let Err(e) = stream_guard.write_all(&tcp_packet.data).await {
                                                             error!("Failed to write to TCP stream {}: {}", tcp_packet.connection_id, e);
                                                         } else {
-                                                            debug!("Wrote {} bytes to TCP stream {}", tcp_packet.data.len(), tcp_packet.connection_id);
+                                                            info!("Wrote {} bytes to TCP stream {}", tcp_packet.data.len(), tcp_packet.connection_id);
                                                             
                                                             // Update connection
                                                             let mut conn_mgr = tcp_connections.lock().await;
                                                             if let Some(conn) = conn_mgr.get_connection(tcp_packet.connection_id) {
                                                                 conn.update_activity();
                                                             }
+                                                            
+                                                            // Send ACK back to client (optional, but helps with flow control)
+                                                            // Note: In a full TCP implementation, we'd track sequence numbers
+                                                            // For now, we'll just acknowledge receipt
                                                         }
                                                     } else {
                                                         warn!("No TCP stream found for connection {}", tcp_packet.connection_id);
@@ -526,7 +533,13 @@ async fn main() -> Result<()> {
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!("Failed to extract TCP packet: {}", e);
+                                                error!("Failed to extract TCP packet: {} (reassembled_data len: {}, first 20 bytes: {:?})", 
+                                                       e, reassembled_data.len(), 
+                                                       if reassembled_data.len() >= 20 { 
+                                                           &reassembled_data[..20] 
+                                                       } else { 
+                                                           &reassembled_data[..] 
+                                                       });
                                             }
                                         }
                                     } else {
