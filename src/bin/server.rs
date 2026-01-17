@@ -357,8 +357,6 @@ async fn main() -> Result<()> {
                         info!("Received DNS query from {} ({} bytes)", dns_source, len);
                         match codec.decode_from_dns_query(&message, &config.domains) {
                             Ok(Some(mut packet)) => {
-                                // Wrap in a block to ensure we handle errors properly
-                                let result = async {
                                 // Set the actual source from DNS query
                                 packet.source = dns_source;
                                 
