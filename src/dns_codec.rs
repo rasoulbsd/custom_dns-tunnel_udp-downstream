@@ -149,6 +149,10 @@ impl DnsCodec {
         let total_fragments = decoded[3];
         let data = decoded[4..].to_vec();
 
+        // Check if this is a TCP packet (starts with connection_id after reassembly)
+        // For fragments, we can't determine this yet, so we'll check after reassembly
+        let is_tcp = false; // Will be determined after reassembly
+
         // We don't have source/dest in DNS query, so we'll use placeholder
         // The actual source will be set by the server based on the DNS query source
         Ok(Some(TunnelPacket {
@@ -158,6 +162,7 @@ impl DnsCodec {
             packet_id,
             fragment_id,
             total_fragments,
+            is_tcp,
         }))
     }
 
@@ -208,6 +213,9 @@ impl DnsCodec {
         
         let packet_data = data[4..].to_vec();
 
+        // Check if this is a TCP packet (will be determined after reassembly)
+        let is_tcp = false;
+
         Ok(Some(TunnelPacket {
             data: packet_data,
             source: "0.0.0.0:0".parse().unwrap(),
@@ -215,6 +223,7 @@ impl DnsCodec {
             packet_id,
             fragment_id,
             total_fragments,
+            is_tcp,
         }))
     }
 

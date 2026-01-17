@@ -4,6 +4,11 @@ use dns_tunnel::{
     config::{load_server_config, ServerConfig},
     dns_codec::DnsCodec,
     packet::{fragment_packet, PacketReassembler},
+    tcp_proxy::{
+        create_tcp_ack_packet, create_tcp_data_packet, create_tcp_fin_packet, create_tcp_rst_packet,
+        create_tcp_syn_ack_packet, extract_tcp_packet, TcpConnectionManager, TcpPacketFlags,
+        ConnectionState,
+    },
     utils::get_random_port,
 };
 use hickory_proto::{
@@ -14,7 +19,8 @@ use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
@@ -38,6 +44,141 @@ struct Args {
     max_subdomain_length: usize,
     #[arg(long)]
     randomize_dns_port: bool,
+}
+
+async fn send_tcp_response_via_udp(
+    codec: &Arc<DnsCodec>,
+    client_socket: &Arc<UdpSocket>,
+    tcp_packet: &dns_tunnel::tcp_proxy::TcpPacket,
+    client_addr: SocketAddr,
+    packet_id: u16,
+) {
+    let tcp_data = tcp_packet.serialize();
+    let max_chunk = 65507 - 4; // Max UDP size minus header
+    let fragments = fragment_packet(&tcp_data, max_chunk);
+    let total_fragments = fragments.len() as u8;
+    
+    for (fragment_id, fragment_data) in fragments.iter().enumerate() {
+        let udp_packet = codec.encode_udp_packet(
+            fragment_data,
+            packet_id,
+            fragment_id as u8,
+            total_fragments,
+        );
+        
+        if let Err(e) = client_socket.send_to(&udp_packet, client_addr).await {
+            warn!("Failed to send TCP response via UDP: {}", e);
+        } else {
+            debug!("Sent TCP response fragment {}/{} via UDP", fragment_id + 1, total_fragments);
+        }
+    }
+}
+
+async fn handle_tcp_response(
+    stream: Arc<Mutex<TcpStream>>,
+    connection_id: u32,
+    codec: Arc<DnsCodec>,
+    client_socket: Arc<UdpSocket>,
+    conn_to_client: Arc<Mutex<HashMap<u32, SocketAddr>>>,
+    tcp_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<TcpStream>>>>>,
+    tcp_connections: Arc<Mutex<TcpConnectionManager>>,
+) {
+    let mut buf = vec![0u8; 8192];
+    let mut packet_id_counter = 0u16;
+    let mut sequence = 1u32;
+    
+    loop {
+        let read_result = {
+            let mut stream_guard = stream.lock().await;
+            stream_guard.read(&mut buf).await
+        };
+        
+        match read_result {
+            Ok(0) => {
+                // EOF - send FIN
+                info!("TCP connection {} closed by target", connection_id);
+                let fin_packet = create_tcp_fin_packet(connection_id, sequence);
+                
+                let client_addr = {
+                    let conn_map = conn_to_client.lock().await;
+                    conn_map.get(&connection_id).copied()
+                };
+                
+                if let Some(addr) = client_addr {
+                    let packet_id = {
+                        let mut counter = packet_id_counter;
+                        packet_id_counter = packet_id_counter.wrapping_add(1);
+                        counter
+                    };
+                    
+                    send_tcp_response_via_udp(
+                        &codec,
+                        &client_socket,
+                        &fin_packet,
+                        addr,
+                        packet_id,
+                    ).await;
+                }
+                break;
+            }
+            Ok(n) => {
+                let data = &buf[..n];
+                debug!("Read {} bytes from TCP stream {}", n, connection_id);
+                
+                // Create TCP data packet
+                let tcp_packet = create_tcp_data_packet(connection_id, sequence, data);
+                sequence = sequence.wrapping_add(n as u32);
+                
+                let client_addr = {
+                    let conn_map = conn_to_client.lock().await;
+                    conn_map.get(&connection_id).copied()
+                };
+                
+                if let Some(addr) = client_addr {
+                    let packet_id = {
+                        let mut counter = packet_id_counter;
+                        packet_id_counter = packet_id_counter.wrapping_add(1);
+                        counter
+                    };
+                    
+                    send_tcp_response_via_udp(
+                        &codec,
+                        &client_socket,
+                        &tcp_packet,
+                        addr,
+                        packet_id,
+                    ).await;
+                    
+                    // Update connection
+                    let mut conn_mgr = tcp_connections.lock().await;
+                    if let Some(conn) = conn_mgr.get_connection(connection_id) {
+                        conn.update_activity();
+                    }
+                } else {
+                    warn!("No client address found for connection {}", connection_id);
+                }
+            }
+            Err(e) => {
+                error!("Error reading from TCP stream {}: {}", connection_id, e);
+                break;
+            }
+        }
+    }
+    
+    // Cleanup
+    {
+        let mut conn_mgr = tcp_connections.lock().await;
+        conn_mgr.remove_connection(connection_id);
+    }
+    {
+        let mut streams = tcp_streams.lock().await;
+        streams.remove(&connection_id);
+    }
+    {
+        let mut conn_to_client = conn_to_client.lock().await;
+        conn_to_client.remove(&connection_id);
+    }
+    info!("TCP connection {} handler closed", connection_id);
 }
 
 #[tokio::main]
@@ -88,6 +229,7 @@ async fn main() -> Result<()> {
     info!("Starting DNS Tunnel Server");
     info!("DNS bind: {}", dns_bind);
     info!("Target UDP: {:?}", target_udp);
+    info!("Target TCP: {:?}", config.tcp_target);
     info!("Client UDP port: {:?}", config.client_udp_port);
     info!("Domains: {:?}", config.domains);
     info!("Max subdomain length: {}", config.max_subdomain_length);
@@ -118,6 +260,12 @@ async fn main() -> Result<()> {
     // Map: packet_id -> client_udp_addr (for responses from target)
     // We'll use the DNS query source IP and a UDP port (we'll need to get this from config or embed in query)
     let packet_to_client_udp: Arc<Mutex<HashMap<u16, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
+    // TCP connection management
+    let tcp_connections: Arc<Mutex<TcpConnectionManager>> = Arc::new(Mutex::new(TcpConnectionManager::new()));
+    // Map: connection_id -> TcpStream to target
+    let tcp_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<TcpStream>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Map: connection_id -> client_udp_addr for responses
+    let tcp_connection_to_client: Arc<Mutex<HashMap<u32, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
     
     // Create a UDP socket for sending responses directly to client
     let client_response_socket = Arc::new(UdpSocket::bind("0.0.0.0:0")
@@ -228,22 +376,178 @@ async fn main() -> Result<()> {
                                 if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
                                     info!("Reassembled packet {} ({} bytes)", packet.packet_id, reassembled_data.len());
 
-                                    // Forward to target UDP
-                                    if let Some(ref target_sock) = target_socket {
-                                        if let Some(target_addr) = config.target_udp {
-                                            if let Err(e) = target_sock.send_to(&reassembled_data, target_addr).await {
-                                                error!("Failed to forward packet to target: {}", e);
-                                            } else {
-                                                info!("Forwarded packet to {}", target_addr);
+                                    // Check if this is a TCP packet
+                                    if PacketReassembler::is_tcp_packet(&reassembled_data) {
+                                        // Handle TCP packet
+                                        match extract_tcp_packet(&reassembled_data) {
+                                            Ok(tcp_packet) => {
+                                                debug!("Received TCP packet: connection_id={}, sequence={}, flags={}", 
+                                                       tcp_packet.connection_id, tcp_packet.sequence, tcp_packet.flags);
+                                                
+                                                let client_udp_addr = {
+                                                    let client_udp_port = config.client_udp_port.unwrap_or(5353);
+                                                    SocketAddr::new(dns_source.ip(), client_udp_port)
+                                                };
+                                                
+                                                // Store client address for this connection
+                                                {
+                                                    let mut conn_to_client = tcp_connection_to_client.lock().await;
+                                                    conn_to_client.insert(tcp_packet.connection_id, client_udp_addr);
+                                                }
+                                                
+                                                let flags = TcpPacketFlags::from_byte(tcp_packet.flags);
+                                                let has_syn = flags.iter().any(|f| *f == TcpPacketFlags::Syn);
+                                                let has_ack = flags.iter().any(|f| *f == TcpPacketFlags::Ack);
+                                                let has_data = flags.iter().any(|f| *f == TcpPacketFlags::Data);
+                                                let has_fin = flags.iter().any(|f| *f == TcpPacketFlags::Fin);
+                                                
+                                                if has_syn && !has_ack {
+                                                    // SYN: establish connection to target
+                                                    if let Some(tcp_target) = config.tcp_target {
+                                                        info!("Establishing TCP connection {} to {}", tcp_packet.connection_id, tcp_target);
+                                                        
+                                                        // Create connection entry with client's connection ID
+                                                        {
+                                                            let mut conn_mgr = tcp_connections.lock().await;
+                                                            conn_mgr.create_connection_with_id(tcp_packet.connection_id, dns_source, tcp_target);
+                                                        }
+                                                        
+                                                        match TcpStream::connect(tcp_target).await {
+                                                            Ok(stream) => {
+                                                                let stream = Arc::new(Mutex::new(stream));
+                                                                {
+                                                                    let mut streams = tcp_streams.lock().await;
+                                                                    streams.insert(tcp_packet.connection_id, stream.clone());
+                                                                }
+                                                                
+                                                                {
+                                                                    let mut conn_mgr = tcp_connections.lock().await;
+                                                                    if let Some(conn) = conn_mgr.get_connection(tcp_packet.connection_id) {
+                                                                        conn.state = ConnectionState::Established;
+                                                                        conn.update_activity();
+                                                                    }
+                                                                }
+                                                                
+                                                                // Send SYN-ACK
+                                                                let syn_ack = create_tcp_syn_ack_packet(tcp_packet.connection_id, 1);
+                                                                send_tcp_response_via_udp(
+                                                                    &codec,
+                                                                    &client_response_socket,
+                                                                    &syn_ack,
+                                                                    client_udp_addr,
+                                                                    packet.packet_id,
+                                                                ).await;
+                                                                
+                                                                // Spawn task to read from TCP stream and send back
+                                                                let codec_read = codec.clone();
+                                                                let client_socket_read = client_response_socket.clone();
+                                                                let conn_to_client_read = tcp_connection_to_client.clone();
+                                                                let tcp_strs_read = tcp_streams.clone();
+                                                                let tcp_conns_read = tcp_connections.clone();
+                                                                let conn_id = tcp_packet.connection_id;
+                                                                
+                                                                tokio::spawn(async move {
+                                                                    handle_tcp_response(
+                                                                        stream,
+                                                                        conn_id,
+                                                                        codec_read,
+                                                                        client_socket_read,
+                                                                        conn_to_client_read,
+                                                                        tcp_strs_read,
+                                                                        tcp_conns_read,
+                                                                    ).await;
+                                                                });
+                                                            }
+                                                            Err(e) => {
+                                                                error!("Failed to connect to TCP target {}: {}", tcp_target, e);
+                                                                // Send RST
+                                                                let rst = create_tcp_rst_packet(tcp_packet.connection_id);
+                                                                send_tcp_response_via_udp(
+                                                                    &codec,
+                                                                    &client_response_socket,
+                                                                    &rst,
+                                                                    client_udp_addr,
+                                                                    packet.packet_id,
+                                                                ).await;
+                                                            }
+                                                        }
+                                                    }
+                                                } else if has_data {
+                                                    // Data packet: write to TCP stream
+                                                    let streams = tcp_streams.lock().await;
+                                                    if let Some(stream) = streams.get(&tcp_packet.connection_id) {
+                                                        let mut stream_guard = stream.lock().await;
+                                                        if let Err(e) = stream_guard.write_all(&tcp_packet.data).await {
+                                                            error!("Failed to write to TCP stream {}: {}", tcp_packet.connection_id, e);
+                                                        } else {
+                                                            debug!("Wrote {} bytes to TCP stream {}", tcp_packet.data.len(), tcp_packet.connection_id);
+                                                            
+                                                            // Update connection
+                                                            let mut conn_mgr = tcp_connections.lock().await;
+                                                            if let Some(conn) = conn_mgr.get_connection(tcp_packet.connection_id) {
+                                                                conn.update_activity();
+                                                            }
+                                                        }
+                                                    } else {
+                                                        warn!("No TCP stream found for connection {}", tcp_packet.connection_id);
+                                                    }
+                                                } else if has_fin {
+                                                    // FIN: close connection
+                                                    info!("Received FIN for TCP connection {}", tcp_packet.connection_id);
+                                                    let streams = tcp_streams.lock().await;
+                                                    if let Some(stream) = streams.get(&tcp_packet.connection_id) {
+                                                        let mut stream_guard = stream.lock().await;
+                                                        let _ = stream_guard.shutdown().await;
+                                                    }
+                                                    
+                                                    // Send FIN-ACK
+                                                    let fin_ack = create_tcp_fin_packet(tcp_packet.connection_id, tcp_packet.sequence.wrapping_add(1));
+                                                    send_tcp_response_via_udp(
+                                                        &codec,
+                                                        &client_response_socket,
+                                                        &fin_ack,
+                                                        client_udp_addr,
+                                                        packet.packet_id,
+                                                    ).await;
+                                                    
+                                                    // Cleanup
+                                                    {
+                                                        let mut conn_mgr = tcp_connections.lock().await;
+                                                        conn_mgr.remove_connection(tcp_packet.connection_id);
+                                                    }
+                                                    {
+                                                        let mut streams = tcp_streams.lock().await;
+                                                        streams.remove(&tcp_packet.connection_id);
+                                                    }
+                                                    {
+                                                        let mut conn_to_client = tcp_connection_to_client.lock().await;
+                                                        conn_to_client.remove(&tcp_packet.connection_id);
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to extract TCP packet: {}", e);
                                             }
                                         }
                                     } else {
-                                        // No target specified, just log
-                                        debug!("No target UDP configured, packet would be forwarded here");
+                                        // Regular UDP packet
+                                        // Forward to target UDP
+                                        if let Some(ref target_sock) = target_socket {
+                                            if let Some(target_addr) = config.target_udp {
+                                                if let Err(e) = target_sock.send_to(&reassembled_data, target_addr).await {
+                                                    error!("Failed to forward packet to target: {}", e);
+                                                } else {
+                                                    info!("Forwarded packet to {}", target_addr);
+                                                }
+                                            }
+                                        } else {
+                                            // No target specified, just log
+                                            debug!("No target UDP configured, packet would be forwarded here");
+                                        }
+                                        
+                                        // Don't remove from pending_requests yet - we need it for response matching
+                                        // It will be removed when we receive the response from target
                                     }
-                                    
-                                    // Don't remove from pending_requests yet - we need it for response matching
-                                    // It will be removed when we receive the response from target
                                 }
                             }
                             Ok(None) => {

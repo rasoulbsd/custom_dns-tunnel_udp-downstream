@@ -3,7 +3,12 @@ use clap::Parser;
 use dns_tunnel::{
     config::{load_client_config, ClientConfig},
     dns_codec::DnsCodec,
-    packet::{fragment_packet, PacketReassembler},
+    packet::{fragment_packet, PacketReassembler, TunnelPacket},
+    tcp_proxy::{
+        create_tcp_ack_packet, create_tcp_data_packet, create_tcp_fin_packet, create_tcp_rst_packet,
+        create_tcp_syn_ack_packet, create_tcp_syn_packet, extract_tcp_packet, TcpConnectionManager,
+        TcpPacketFlags, ConnectionState,
+    },
     utils::{get_random_port, rotate_resolver},
 };
 use hickory_proto::{
@@ -14,7 +19,8 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
@@ -38,6 +44,198 @@ struct Args {
     no_rotate_resolvers: bool,
     #[arg(long)]
     randomize_local_port: bool,
+}
+
+async fn send_tcp_packet_via_dns(
+    codec: &Arc<DnsCodec>,
+    dns_socket: &Arc<UdpSocket>,
+    config: &ClientConfig,
+    resolver_index: &Arc<Mutex<usize>>,
+    data: &[u8],
+    packet_id: u16,
+) {
+    let max_chunk = codec.max_payload_per_query();
+    let fragments = fragment_packet(data, max_chunk);
+    let total_fragments = fragments.len() as u8;
+    
+    let domain = &config.domains[rand::thread_rng().gen_range(0..config.domains.len())];
+    let resolver = if config.rotate_resolvers {
+        let mut idx = resolver_index.lock().await;
+        *idx = (*idx + 1) % config.resolvers.len();
+        rotate_resolver(&config.resolvers, *idx)
+    } else {
+        &config.resolvers[rand::thread_rng().gen_range(0..config.resolvers.len())]
+    };
+    
+    for (fragment_id, fragment_data) in fragments.iter().enumerate() {
+        match codec.encode_to_dns_query(
+            fragment_data,
+            domain,
+            packet_id,
+            fragment_id as u8,
+            total_fragments,
+        ) {
+            Ok(dns_query) => {
+                let mut buf = Vec::new();
+                let mut encoder = BinEncoder::new(&mut buf);
+                if let Err(e) = dns_query.emit(&mut encoder) {
+                    error!("Failed to encode DNS query: {}", e);
+                    continue;
+                }
+                
+                let query_bytes = encoder.into_bytes();
+                
+                for resolver in &config.resolvers {
+                    if let Err(e) = dns_socket.send_to(&query_bytes, resolver).await {
+                        warn!("Failed to send DNS query to {}: {}", resolver, e);
+                    } else {
+                        debug!("Sent TCP packet fragment {}/{} via DNS to {}", 
+                               fragment_id + 1, total_fragments, resolver);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to encode TCP packet to DNS: {}", e);
+            }
+        }
+    }
+}
+
+async fn handle_tcp_connection(
+    stream: Arc<Mutex<TcpStream>>,
+    connection_id: u32,
+    codec: Arc<DnsCodec>,
+    dns_socket: Arc<UdpSocket>,
+    config: ClientConfig,
+    tcp_connections: Arc<Mutex<TcpConnectionManager>>,
+    tcp_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<TcpStream>>>>>,
+    pending_tcp_requests: Arc<Mutex<HashMap<u16, u32>>>,
+    resolver_index: Arc<Mutex<usize>>,
+) {
+    let mut packet_id_counter = 0u16;
+    let mut buf = vec![0u8; 8192];
+    let mut established = false;
+    
+    // Wait for SYN-ACK (connection establishment)
+    // For simplicity, we'll assume connection is established after a short delay
+    // In production, you'd wait for actual SYN-ACK response
+    sleep(Duration::from_millis(100)).await;
+    
+    {
+        let mut conn_mgr = tcp_connections.lock().await;
+        if let Some(conn) = conn_mgr.get_connection(connection_id) {
+            conn.state = ConnectionState::Established;
+            conn.update_activity();
+            established = true;
+        }
+    }
+    
+    if !established {
+        warn!("TCP connection {} not established", connection_id);
+        return;
+    }
+    
+    info!("TCP connection {} established", connection_id);
+    
+    // Read from TCP stream and send via DNS tunnel
+    loop {
+        let read_result = {
+            let mut stream_guard = stream.lock().await;
+            stream_guard.read(&mut buf).await
+        };
+        
+        match read_result {
+            Ok(0) => {
+                // EOF - send FIN
+                info!("TCP connection {} closed by client", connection_id);
+                let fin_packet = {
+                    let mut conn_mgr = tcp_connections.lock().await;
+                    if let Some(conn) = conn_mgr.get_connection(connection_id) {
+                        let seq = conn.next_sequence;
+                        conn.next_sequence = conn.next_sequence.wrapping_add(1);
+                        create_tcp_fin_packet(connection_id, seq)
+                    } else {
+                        break;
+                    }
+                };
+                
+                let fin_data = fin_packet.serialize();
+                let packet_id = {
+                    let mut counter = packet_id_counter;
+                    packet_id_counter = packet_id_counter.wrapping_add(1);
+                    counter
+                };
+                
+                {
+                    let mut pending = pending_tcp_requests.lock().await;
+                    pending.insert(packet_id, connection_id);
+                }
+                
+                send_tcp_packet_via_dns(
+                    &codec,
+                    &dns_socket,
+                    &config,
+                    &resolver_index,
+                    &fin_data,
+                    packet_id,
+                ).await;
+                break;
+            }
+            Ok(n) => {
+                let data = &buf[..n];
+                debug!("Read {} bytes from TCP connection {}", n, connection_id);
+                
+                // Create TCP data packet
+                let tcp_packet = {
+                    let mut conn_mgr = tcp_connections.lock().await;
+                    if let Some(conn) = conn_mgr.get_connection(connection_id) {
+                        let seq = conn.next_sequence;
+                        conn.next_sequence = conn.next_sequence.wrapping_add(data.len() as u32);
+                        conn.update_activity();
+                        create_tcp_data_packet(connection_id, seq, data)
+                    } else {
+                        break;
+                    }
+                };
+                
+                let packet_data = tcp_packet.serialize();
+                let packet_id = {
+                    let mut counter = packet_id_counter;
+                    packet_id_counter = packet_id_counter.wrapping_add(1);
+                    counter
+                };
+                
+                {
+                    let mut pending = pending_tcp_requests.lock().await;
+                    pending.insert(packet_id, connection_id);
+                }
+                
+                send_tcp_packet_via_dns(
+                    &codec,
+                    &dns_socket,
+                    &config,
+                    &resolver_index,
+                    &packet_data,
+                    packet_id,
+                ).await;
+            }
+            Err(e) => {
+                error!("Error reading from TCP stream {}: {}", connection_id, e);
+                break;
+            }
+        }
+    }
+    
+    // Cleanup
+    {
+        let mut conn_mgr = tcp_connections.lock().await;
+        conn_mgr.remove_connection(connection_id);
+    }
+    {
+        let mut streams = tcp_streams.lock().await;
+        streams.remove(&connection_id);
+    }
+    info!("TCP connection {} closed", connection_id);
 }
 
 #[tokio::main]
@@ -127,7 +325,99 @@ async fn main() -> Result<()> {
     let codec = Arc::new(DnsCodec::new(config.max_subdomain_length));
     let reassembler = Arc::new(Mutex::new(PacketReassembler::new()));
     let pending_requests: Arc<Mutex<HashMap<u16, (SocketAddr, u16)>>> = Arc::new(Mutex::new(HashMap::new()));
+    let pending_tcp_requests: Arc<Mutex<HashMap<u16, u32>>> = Arc::new(Mutex::new(HashMap::new())); // packet_id -> connection_id
+    let tcp_connections: Arc<Mutex<TcpConnectionManager>> = Arc::new(Mutex::new(TcpConnectionManager::new()));
+    let tcp_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<TcpStream>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let resolver_index = Arc::new(Mutex::new(0usize));
+
+    // Start TCP listener if configured
+    if let Some(tcp_listen_addr) = config.tcp_listen {
+        let tcp_listener = TcpListener::bind(&tcp_listen_addr)
+            .await
+            .context("Failed to bind TCP listener")?;
+        info!("TCP listener bound to: {}", tcp_listen_addr);
+        
+        let codec_clone = codec.clone();
+        let dns_query_socket_clone = dns_query_socket.clone();
+        let config_clone = config.clone();
+        let tcp_connections_clone = tcp_connections.clone();
+        let tcp_streams_clone = tcp_streams.clone();
+        let pending_tcp_requests_clone = pending_tcp_requests.clone();
+        let resolver_index_clone = resolver_index.clone();
+        let mut packet_id_counter_tcp = 0u16;
+        
+        tokio::spawn(async move {
+            loop {
+                match tcp_listener.accept().await {
+                    Ok((stream, addr)) => {
+                        info!("New TCP connection from: {}", addr);
+                        let connection_id = {
+                            let mut conn_mgr = tcp_connections_clone.lock().await;
+                            conn_mgr.create_connection(addr, "0.0.0.0:0".parse().unwrap())
+                        };
+                        
+                        let stream = Arc::new(Mutex::new(stream));
+                        {
+                            let mut streams = tcp_streams_clone.lock().await;
+                            streams.insert(connection_id, stream.clone());
+                        }
+                        
+                        // Send SYN packet
+                        let syn_packet = create_tcp_syn_packet(connection_id);
+                        let syn_data = syn_packet.serialize();
+                        
+                        let packet_id = {
+                            let mut counter = packet_id_counter_tcp;
+                            packet_id_counter_tcp = packet_id_counter_tcp.wrapping_add(1);
+                            counter
+                        };
+                        
+                        {
+                            let mut pending = pending_tcp_requests_clone.lock().await;
+                            pending.insert(packet_id, connection_id);
+                        }
+                        
+                        // Send SYN via DNS tunnel
+                        send_tcp_packet_via_dns(
+                            &codec_clone,
+                            &dns_query_socket_clone,
+                            &config_clone,
+                            &resolver_index_clone,
+                            &syn_data,
+                            packet_id,
+                        ).await;
+                        
+                        // Handle TCP connection
+                        let codec_conn = codec_clone.clone();
+                        let dns_socket_conn = dns_query_socket_clone.clone();
+                        let config_conn = config_clone.clone();
+                        let tcp_conns = tcp_connections_clone.clone();
+                        let tcp_strs = tcp_streams_clone.clone();
+                        let pending_tcp = pending_tcp_requests_clone.clone();
+                        let resolver_idx = resolver_index_clone.clone();
+                        
+                        tokio::spawn(async move {
+                            handle_tcp_connection(
+                                stream,
+                                connection_id,
+                                codec_conn,
+                                dns_socket_conn,
+                                config_conn,
+                                tcp_conns,
+                                tcp_strs,
+                                pending_tcp,
+                                resolver_idx,
+                            ).await;
+                        });
+                    }
+                    Err(e) => {
+                        error!("Error accepting TCP connection: {}", e);
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+    }
 
     // Main loop: receive packets and handle both local UDP and DNS responses
     let mut buf = vec![0u8; 65535];
@@ -170,18 +460,95 @@ async fn main() -> Result<()> {
                                packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
                         let mut reass = reassembler.lock().await;
                         if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
-                            // Find the original source
-                            let mut pending = pending_requests.lock().await;
-                            if let Some((original_source, _)) = pending.remove(&packet.packet_id) {
-                                // Forward reassembled packet to original source
-                                if let Err(e) = udp_socket.send_to(&reassembled_data, original_source).await {
-                                    error!("Failed to send reassembled packet: {}", e);
-                                } else {
-                                    info!("Sent reassembled packet {} ({} bytes) to {}", 
-                                          packet.packet_id, reassembled_data.len(), original_source);
+                            // Check if this is a TCP packet
+                            if PacketReassembler::is_tcp_packet(&reassembled_data) {
+                                // Handle TCP packet
+                                match extract_tcp_packet(&reassembled_data) {
+                                    Ok(tcp_packet) => {
+                                        debug!("Received TCP packet: connection_id={}, sequence={}, flags={}", 
+                                               tcp_packet.connection_id, tcp_packet.sequence, tcp_packet.flags);
+                                        
+                                        let flags = TcpPacketFlags::from_byte(tcp_packet.flags);
+                                        
+                                        // Handle different TCP packet types
+                                        let has_syn = flags.iter().any(|f| *f == TcpPacketFlags::Syn);
+                                        let has_ack = flags.iter().any(|f| *f == TcpPacketFlags::Ack);
+                                        let has_data = flags.iter().any(|f| *f == TcpPacketFlags::Data);
+                                        let has_fin = flags.iter().any(|f| *f == TcpPacketFlags::Fin);
+                                        
+                                        if has_syn && has_ack {
+                                            // SYN-ACK: connection established
+                                            let mut conn_mgr = tcp_connections.lock().await;
+                                            if let Some(conn) = conn_mgr.get_connection(tcp_packet.connection_id) {
+                                                conn.state = ConnectionState::Established;
+                                                conn.expected_sequence = tcp_packet.sequence.wrapping_add(1);
+                                                conn.update_activity();
+                                                
+                                                // Send ACK
+                                                let ack_packet = create_tcp_ack_packet(tcp_packet.connection_id, conn.expected_sequence);
+                                                let ack_data = ack_packet.serialize();
+                                                let ack_packet_id = packet_id_counter;
+                                                packet_id_counter = packet_id_counter.wrapping_add(1);
+                                                
+                                                {
+                                                    let mut pending = pending_tcp_requests.lock().await;
+                                                    pending.insert(ack_packet_id, tcp_packet.connection_id);
+                                                }
+                                                
+                                                send_tcp_packet_via_dns(
+                                                    &codec,
+                                                    &dns_query_socket,
+                                                    &config,
+                                                    &resolver_index,
+                                                    &ack_data,
+                                                    ack_packet_id,
+                                                ).await;
+                                            }
+                                        } else if has_data {
+                                            // Data packet: write to TCP stream
+                                            let streams = tcp_streams.lock().await;
+                                            if let Some(stream) = streams.get(&tcp_packet.connection_id) {
+                                                let mut stream_guard = stream.lock().await;
+                                                if let Err(e) = stream_guard.write_all(&tcp_packet.data).await {
+                                                    error!("Failed to write to TCP stream {}: {}", tcp_packet.connection_id, e);
+                                                } else {
+                                                    debug!("Wrote {} bytes to TCP stream {}", tcp_packet.data.len(), tcp_packet.connection_id);
+                                                    
+                                                    // Update connection
+                                                    let mut conn_mgr = tcp_connections.lock().await;
+                                                    if let Some(conn) = conn_mgr.get_connection(tcp_packet.connection_id) {
+                                                        conn.expected_sequence = tcp_packet.sequence.wrapping_add(tcp_packet.data.len() as u32);
+                                                        conn.update_activity();
+                                                    }
+                                                }
+                                            }
+                                        } else if has_fin {
+                                            // FIN: close connection
+                                            info!("Received FIN for TCP connection {}", tcp_packet.connection_id);
+                                            let mut conn_mgr = tcp_connections.lock().await;
+                                            conn_mgr.remove_connection(tcp_packet.connection_id);
+                                            let mut streams = tcp_streams.lock().await;
+                                            streams.remove(&tcp_packet.connection_id);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to extract TCP packet: {}", e);
+                                    }
                                 }
                             } else {
-                                warn!("No pending request found for packet_id: {}", packet.packet_id);
+                                // Regular UDP packet
+                                let mut pending = pending_requests.lock().await;
+                                if let Some((original_source, _)) = pending.remove(&packet.packet_id) {
+                                    // Forward reassembled packet to original source
+                                    if let Err(e) = udp_socket.send_to(&reassembled_data, original_source).await {
+                                        error!("Failed to send reassembled packet: {}", e);
+                                    } else {
+                                        info!("Sent reassembled packet {} ({} bytes) to {}", 
+                                              packet.packet_id, reassembled_data.len(), original_source);
+                                    }
+                                } else {
+                                    warn!("No pending request found for packet_id: {}", packet.packet_id);
+                                }
                             }
                         }
                     }
