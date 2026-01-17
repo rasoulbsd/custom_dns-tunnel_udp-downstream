@@ -11,7 +11,7 @@ use hickory_proto::{
     serialize::binary::{BinDecodable, BinEncodable, BinEncoder},
 };
 use log::{debug, error, info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -117,9 +117,13 @@ async fn main() -> Result<()> {
     let reassembler = Arc::new(Mutex::new(PacketReassembler::new()));
     // Map: packet_id -> (dns_source, query_id)
     let pending_requests: Arc<Mutex<HashMap<u16, (SocketAddr, u16)>>> = Arc::new(Mutex::new(HashMap::new()));
-    // Map: data_hash -> (packet_id, client_udp_addr, timestamp) for matching responses from target_udp
-    // This allows us to match echo responses to the correct packet_id using data hash
+    // Queue for matching responses from target_udp to packet_id
+    // For echo servers: we can use hash-based matching (exact data match)
+    // For real services (OpenVPN, etc): we use FIFO queue (responses come in order)
+    // Hybrid approach: try hash first, fallback to FIFO
     let data_hash_to_packet: Arc<Mutex<HashMap<u64, (u16, SocketAddr, Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
+    // FIFO queue for non-echo services: (packet_id, client_udp_addr, timestamp, data_hash)
+    let response_queue: Arc<Mutex<VecDeque<(u16, SocketAddr, Instant, u64)>>> = Arc::new(Mutex::new(VecDeque::new()));
     
     // Create a UDP socket for sending responses directly to client
     let client_response_socket = Arc::new(UdpSocket::bind("0.0.0.0:0")
@@ -133,6 +137,7 @@ async fn main() -> Result<()> {
             let codec = codec.clone();
             let client_response_socket = client_response_socket.clone();
             let data_hash_to_packet = data_hash_to_packet.clone();
+            let response_queue = response_queue.clone();
             
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65507];
@@ -144,21 +149,33 @@ async fn main() -> Result<()> {
                             let data = &buf[..len];
                             debug!("Received {} bytes from target", len);
 
-                            // Compute hash of received data to match with outgoing request
+                            // Compute hash of received data
                             let mut hasher = DefaultHasher::new();
                             data.hash(&mut hasher);
                             let data_hash = hasher.finish();
                             
-                            // Find the original packet_id and client UDP address
+                            let now = Instant::now();
                             let mut hash_map = data_hash_to_packet.lock().await;
+                            let mut queue = response_queue.lock().await;
                             
                             // Clean up old entries
-                            let now = Instant::now();
                             hash_map.retain(|_, (_, _, timestamp)| {
                                 now.duration_since(*timestamp) < RESPONSE_TIMEOUT
                             });
+                            queue.retain(|(_, _, timestamp, _)| {
+                                now.duration_since(*timestamp) < RESPONSE_TIMEOUT
+                            });
                             
-                            if let Some((original_packet_id, client_udp_addr, _)) = hash_map.remove(&data_hash) {
+                            // Try hash-based matching first (for echo servers)
+                            let matched = if let Some((original_packet_id, client_udp_addr, _)) = hash_map.remove(&data_hash) {
+                                Some((original_packet_id, client_udp_addr))
+                            } else {
+                                // Fallback to FIFO queue matching (for real services like OpenVPN)
+                                // Responses typically come back in order for stateful protocols
+                                queue.pop_front().map(|(packet_id, client_udp_addr, _, _)| (packet_id, client_udp_addr))
+                            };
+                            
+                            if let Some((original_packet_id, client_udp_addr)) = matched {
                                 info!("Matched target response to packet_id: {}, sending to {}", 
                                       original_packet_id, client_udp_addr);
                                 
@@ -238,22 +255,30 @@ async fn main() -> Result<()> {
                                     // Forward to target UDP
                                     if let Some(ref target_sock) = target_socket {
                                         if let Some(target_addr) = config.target_udp {
-                                            // Compute hash of data to match response later
+                                            // Compute hash of data for hash-based matching (echo servers)
                                             let mut hasher = DefaultHasher::new();
                                             reassembled_data.hash(&mut hasher);
                                             let data_hash = hasher.finish();
                                             
-                                            // Store mapping: data_hash -> (packet_id, client_udp_addr)
+                                            let now = Instant::now();
+                                            
+                                            // Store in both hash map (for echo servers) and queue (for real services)
                                             {
                                                 let mut hash_map = data_hash_to_packet.lock().await;
-                                                hash_map.insert(data_hash, (packet.packet_id, client_udp_addr, Instant::now()));
+                                                hash_map.insert(data_hash, (packet.packet_id, client_udp_addr, now));
+                                            }
+                                            {
+                                                let mut queue = response_queue.lock().await;
+                                                queue.push_back((packet.packet_id, client_udp_addr, now, data_hash));
                                             }
                                             
                                             if let Err(e) = target_sock.send_to(&reassembled_data, target_addr).await {
                                                 error!("Failed to forward packet to target: {}", e);
-                                                // Remove from hash map on error
+                                                // Remove from both maps on error
                                                 let mut hash_map = data_hash_to_packet.lock().await;
                                                 hash_map.remove(&data_hash);
+                                                let mut queue = response_queue.lock().await;
+                                                queue.retain(|(pid, _, _, h)| *pid != packet.packet_id && *h != data_hash);
                                             } else {
                                                 info!("Forwarded packet {} (hash: {}) to {}", packet.packet_id, data_hash, target_addr);
                                             }
