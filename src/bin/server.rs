@@ -357,6 +357,8 @@ async fn main() -> Result<()> {
                         info!("Received DNS query from {} ({} bytes)", dns_source, len);
                         match codec.decode_from_dns_query(&message, &config.domains) {
                             Ok(Some(mut packet)) => {
+                                // Wrap in a block to ensure we handle errors properly
+                                let result = async {
                                 // Set the actual source from DNS query
                                 packet.source = dns_source;
                                 
@@ -380,6 +382,12 @@ async fn main() -> Result<()> {
                                 let mut reass = reassembler.lock().await;
                                 if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
                                     info!("Reassembled packet {} ({} bytes)", packet.packet_id, reassembled_data.len());
+                                    
+                                    // Remove from pending_requests after reassembly
+                                    {
+                                        let mut pending = pending_requests.lock().await;
+                                        pending.remove(&packet.packet_id);
+                                    }
 
                                     // Check if this is a TCP packet
                                     if PacketReassembler::is_tcp_packet(&reassembled_data) {
@@ -418,67 +426,79 @@ async fn main() -> Result<()> {
                                                             conn_mgr.create_connection_with_id(tcp_packet.connection_id, dns_source, tcp_target);
                                                         }
                                                         
-                                                        match TcpStream::connect(tcp_target).await {
-                                                            Ok(stream) => {
-                                                                info!("Successfully connected to TCP target {} for connection {}", tcp_target, tcp_packet.connection_id);
-                                                                let stream = Arc::new(Mutex::new(stream));
-                                                                {
-                                                                    let mut streams = tcp_streams.lock().await;
-                                                                    streams.insert(tcp_packet.connection_id, stream.clone());
-                                                                }
-                                                                
-                                                                {
-                                                                    let mut conn_mgr = tcp_connections.lock().await;
-                                                                    if let Some(conn) = conn_mgr.get_connection(tcp_packet.connection_id) {
-                                                                        conn.state = ConnectionState::Established;
-                                                                        conn.update_activity();
+                                                        // Spawn connection attempt in a separate task to avoid blocking
+                                                        let codec_conn = codec.clone();
+                                                        let client_socket_conn = client_response_socket.clone();
+                                                        let tcp_conns_conn = tcp_connections.clone();
+                                                        let tcp_strs_conn = tcp_streams.clone();
+                                                        let conn_to_client_conn = tcp_connection_to_client.clone();
+                                                        let conn_id = tcp_packet.connection_id;
+                                                        let tcp_target_conn = tcp_target;
+                                                        let client_addr_conn = client_udp_addr;
+                                                        let packet_id_conn = packet.packet_id;
+                                                        
+                                                        tokio::spawn(async move {
+                                                            match TcpStream::connect(tcp_target_conn).await {
+                                                                Ok(stream) => {
+                                                                    info!("Successfully connected to TCP target {} for connection {}", tcp_target_conn, conn_id);
+                                                                    let stream = Arc::new(Mutex::new(stream));
+                                                                    {
+                                                                        let mut streams = tcp_strs_conn.lock().await;
+                                                                        streams.insert(conn_id, stream.clone());
                                                                     }
-                                                                }
-                                                                
-                                                                // Send SYN-ACK
-                                                                let syn_ack = create_tcp_syn_ack_packet(tcp_packet.connection_id, 1);
-                                                                info!("Sending SYN-ACK for connection {} via UDP to {}", tcp_packet.connection_id, client_udp_addr);
-                                                                send_tcp_response_via_udp(
-                                                                    &codec,
-                                                                    &client_response_socket,
-                                                                    &syn_ack,
-                                                                    client_udp_addr,
-                                                                    packet.packet_id,
-                                                                ).await;
-                                                                
-                                                                // Spawn task to read from TCP stream and send back
-                                                                let codec_read = codec.clone();
-                                                                let client_socket_read = client_response_socket.clone();
-                                                                let conn_to_client_read = tcp_connection_to_client.clone();
-                                                                let tcp_strs_read = tcp_streams.clone();
-                                                                let tcp_conns_read = tcp_connections.clone();
-                                                                let conn_id = tcp_packet.connection_id;
-                                                                
-                                                                tokio::spawn(async move {
-                                                                    handle_tcp_response(
-                                                                        stream,
-                                                                        conn_id,
-                                                                        codec_read,
-                                                                        client_socket_read,
-                                                                        conn_to_client_read,
-                                                                        tcp_strs_read,
-                                                                        tcp_conns_read,
+                                                                    
+                                                                    {
+                                                                        let mut conn_mgr = tcp_conns_conn.lock().await;
+                                                                        if let Some(conn) = conn_mgr.get_connection(conn_id) {
+                                                                            conn.state = ConnectionState::Established;
+                                                                            conn.update_activity();
+                                                                        }
+                                                                    }
+                                                                    
+                                                                    // Send SYN-ACK
+                                                                    let syn_ack = create_tcp_syn_ack_packet(conn_id, 1);
+                                                                    info!("Sending SYN-ACK for connection {} via UDP to {}", conn_id, client_addr_conn);
+                                                                    send_tcp_response_via_udp(
+                                                                        &codec_conn,
+                                                                        &client_socket_conn,
+                                                                        &syn_ack,
+                                                                        client_addr_conn,
+                                                                        packet_id_conn,
                                                                     ).await;
-                                                                });
+                                                                    
+                                                                    // Spawn task to read from TCP stream and send back
+                                                                    let codec_read = codec_conn.clone();
+                                                                    let client_socket_read = client_socket_conn.clone();
+                                                                    let conn_to_client_read = conn_to_client_conn.clone();
+                                                                    let tcp_strs_read = tcp_strs_conn.clone();
+                                                                    let tcp_conns_read = tcp_conns_conn.clone();
+                                                                    
+                                                                    tokio::spawn(async move {
+                                                                        handle_tcp_response(
+                                                                            stream,
+                                                                            conn_id,
+                                                                            codec_read,
+                                                                            client_socket_read,
+                                                                            conn_to_client_read,
+                                                                            tcp_strs_read,
+                                                                            tcp_conns_read,
+                                                                        ).await;
+                                                                    });
+                                                                }
+                                                                Err(e) => {
+                                                                    error!("Failed to connect to TCP target {}: {}", tcp_target_conn, e);
+                                                                    // Send RST
+                                                                    let rst = create_tcp_rst_packet(conn_id);
+                                                                    send_tcp_response_via_udp(
+                                                                        &codec_conn,
+                                                                        &client_socket_conn,
+                                                                        &rst,
+                                                                        client_addr_conn,
+                                                                        packet_id_conn,
+                                                                    ).await;
+                                                                }
                                                             }
-                                                            Err(e) => {
-                                                                error!("Failed to connect to TCP target {}: {}", tcp_target, e);
-                                                                // Send RST
-                                                                let rst = create_tcp_rst_packet(tcp_packet.connection_id);
-                                                                send_tcp_response_via_udp(
-                                                                    &codec,
-                                                                    &client_response_socket,
-                                                                    &rst,
-                                                                    client_udp_addr,
-                                                                    packet.packet_id,
-                                                                ).await;
-                                                            }
-                                                        }
+                                                        });
                                                     }
                                                 } else if has_data {
                                                     // Data packet: write to TCP stream
@@ -547,6 +567,7 @@ async fn main() -> Result<()> {
                                                        } else { 
                                                            &reassembled_data[..] 
                                                        });
+                                                // Continue processing - don't stop the server
                                             }
                                         }
                                     } else {
@@ -592,7 +613,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to parse DNS query: {}", e);
+                        warn!("Failed to parse DNS query from {}: {}", dns_source, e);
                     }
                 }
             }

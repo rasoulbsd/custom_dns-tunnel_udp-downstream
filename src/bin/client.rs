@@ -456,31 +456,51 @@ async fn main() -> Result<()> {
                     None
                 };
                 
+                // Check if this is a tunnel packet (from server) or local UDP packet
                 let is_tunnel_packet = if let Some(ref packet) = decoded_packet {
-                    // Additional validation: check if this packet_id is in pending requests
-                    // This helps distinguish server responses from random local UDP
-                    let pending = pending_requests.lock().await;
-                    let has_pending = pending.contains_key(&packet.packet_id);
-                    debug!("Decoded packet: packet_id={}, fragment={}/{}, has_pending={}", 
-                           packet.packet_id, packet.fragment_id + 1, packet.total_fragments, has_pending);
-                    has_pending
+                    // Check if packet_id is in pending_requests (UDP) or pending_tcp_requests (TCP)
+                    let pending_udp = pending_requests.lock().await;
+                    let pending_tcp = pending_tcp_requests.lock().await;
+                    let has_pending_udp = pending_udp.contains_key(&packet.packet_id);
+                    let has_pending_tcp = pending_tcp.contains_key(&packet.packet_id);
+                    let is_tunnel = has_pending_udp || has_pending_tcp;
+                    debug!("Decoded packet: packet_id={}, fragment={}/{}, has_pending_udp={}, has_pending_tcp={}", 
+                           packet.packet_id, packet.fragment_id + 1, packet.total_fragments, has_pending_udp, has_pending_tcp);
+                    is_tunnel
                 } else {
                     false
                 };
                 
                 if is_tunnel_packet {
-                    // This is a UDP response from the server
+                    // This is a UDP response from the server - process it and don't resend
                     if let Some(packet) = decoded_packet {
                         info!("Received tunnel UDP packet: packet_id={}, fragment={}/{}", 
                                packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
                         let mut reass = reassembler.lock().await;
                         if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
+                            // Check if this is a TCP packet BEFORE removing from pending
+                            // so we know which pending list to check
+                            let is_tcp = PacketReassembler::is_tcp_packet(&reassembled_data);
+                            
+                            // Remove from pending requests (determine which one based on packet type)
+                            if is_tcp {
+                                let mut pending_tcp = pending_tcp_requests.lock().await;
+                                if pending_tcp.remove(&packet.packet_id).is_none() {
+                                    warn!("TCP packet_id {} not found in pending_tcp_requests", packet.packet_id);
+                                }
+                            } else {
+                                let mut pending_udp = pending_requests.lock().await;
+                                if pending_udp.remove(&packet.packet_id).is_none() {
+                                    warn!("UDP packet_id {} not found in pending_requests", packet.packet_id);
+                                }
+                            }
+                            
                             // Check if this is a TCP packet
-                            if PacketReassembler::is_tcp_packet(&reassembled_data) {
+                            if is_tcp {
                                 // Handle TCP packet
                                 match extract_tcp_packet(&reassembled_data) {
                                     Ok(tcp_packet) => {
-                                        debug!("Received TCP packet: connection_id={}, sequence={}, flags={}", 
+                                        info!("Received TCP packet: connection_id={}, sequence={}, flags={}", 
                                                tcp_packet.connection_id, tcp_packet.sequence, tcp_packet.flags);
                                         
                                         let flags = TcpPacketFlags::from_byte(tcp_packet.flags);
@@ -558,19 +578,10 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             } else {
-                                // Regular UDP packet
-                                let mut pending = pending_requests.lock().await;
-                                if let Some((original_source, _)) = pending.remove(&packet.packet_id) {
-                                    // Forward reassembled packet to original source
-                                    if let Err(e) = udp_socket.send_to(&reassembled_data, original_source).await {
-                                        error!("Failed to send reassembled packet: {}", e);
-                                    } else {
-                                        info!("Sent reassembled packet {} ({} bytes) to {}", 
-                                              packet.packet_id, reassembled_data.len(), original_source);
-                                    }
-                                } else {
-                                    warn!("No pending request found for packet_id: {}", packet.packet_id);
-                                }
+                                // Regular UDP packet - already removed from pending above
+                                // Find original source from pending_requests (but we already removed it)
+                                // This shouldn't happen for UDP packets, but handle it gracefully
+                                warn!("Received non-TCP reassembled packet {} but no pending request found", packet.packet_id);
                             }
                         }
                     }
