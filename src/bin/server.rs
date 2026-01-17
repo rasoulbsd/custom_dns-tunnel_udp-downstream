@@ -16,7 +16,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 
 #[derive(Parser)]
 #[command(name = "dns-tunnel-server")]
@@ -24,9 +26,9 @@ use tokio::time::{sleep, Duration};
 struct Args {
     #[arg(short, long)]
     config: Option<String>,
-    #[arg(short, long, default_value = "0.0.0.0")]
+    #[arg(short = 'b', long, default_value = "0.0.0.0")]
     dns_bind_addr: String,
-    #[arg(short, long)]
+    #[arg(short = 'p', long)]
     dns_port: Option<u16>,
     #[arg(short, long)]
     target_udp: Option<String>,
@@ -115,9 +117,9 @@ async fn main() -> Result<()> {
     let reassembler = Arc::new(Mutex::new(PacketReassembler::new()));
     // Map: packet_id -> (dns_source, query_id)
     let pending_requests: Arc<Mutex<HashMap<u16, (SocketAddr, u16)>>> = Arc::new(Mutex::new(HashMap::new()));
-    // Map: packet_id -> client_udp_addr (for responses from target)
-    // We'll use the DNS query source IP and a UDP port (we'll need to get this from config or embed in query)
-    let packet_to_client_udp: Arc<Mutex<HashMap<u16, SocketAddr>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Map: data_hash -> (packet_id, client_udp_addr, timestamp) for matching responses from target_udp
+    // This allows us to match echo responses to the correct packet_id using data hash
+    let data_hash_to_packet: Arc<Mutex<HashMap<u64, (u16, SocketAddr, Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
     
     // Create a UDP socket for sending responses directly to client
     let client_response_socket = Arc::new(UdpSocket::bind("0.0.0.0:0")
@@ -130,10 +132,11 @@ async fn main() -> Result<()> {
             let target_sock = target_sock.clone();
             let codec = codec.clone();
             let client_response_socket = client_response_socket.clone();
-            let packet_to_client_udp = packet_to_client_udp.clone();
+            let data_hash_to_packet = data_hash_to_packet.clone();
             
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65507];
+                const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
                 
                 loop {
                     match target_sock.recv_from(&mut buf).await {
@@ -141,15 +144,22 @@ async fn main() -> Result<()> {
                             let data = &buf[..len];
                             debug!("Received {} bytes from target", len);
 
-                            // Find the original client UDP address using packet_id
-                            // We use FIFO approach: take the first (oldest) entry
-                            // This works because responses come back in order for single-threaded echo server
-                            let mut packet_map = packet_to_client_udp.lock().await;
+                            // Compute hash of received data to match with outgoing request
+                            let mut hasher = DefaultHasher::new();
+                            data.hash(&mut hasher);
+                            let data_hash = hasher.finish();
                             
-                            if let Some((&original_packet_id, &client_udp_addr)) = packet_map.iter().next() {
-                                packet_map.remove(&original_packet_id);
-                                
-                                info!("Matching target response to original packet_id: {}, sending to {}", 
+                            // Find the original packet_id and client UDP address
+                            let mut hash_map = data_hash_to_packet.lock().await;
+                            
+                            // Clean up old entries
+                            let now = Instant::now();
+                            hash_map.retain(|_, (_, _, timestamp)| {
+                                now.duration_since(*timestamp) < RESPONSE_TIMEOUT
+                            });
+                            
+                            if let Some((original_packet_id, client_udp_addr, _)) = hash_map.remove(&data_hash) {
+                                info!("Matched target response to packet_id: {}, sending to {}", 
                                       original_packet_id, client_udp_addr);
                                 
                                 // Fragment and encode as UDP packets (not DNS)
@@ -178,7 +188,7 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             } else {
-                                warn!("No matching client UDP address found for target response");
+                                warn!("No matching packet_id found for target response (hash: {})", data_hash);
                             }
                         }
                         Err(e) => {
@@ -210,17 +220,10 @@ async fn main() -> Result<()> {
                                 info!("Decoded DNS query from {}: packet_id={}, fragment={}/{}", 
                                        dns_source, packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
 
-                                // Store pending request and client UDP address for response routing
+                                // Store pending request for DNS response (if needed)
                                 {
                                     let mut pending = pending_requests.lock().await;
                                     pending.insert(packet.packet_id, (dns_source, message.id()));
-                                    
-                                    // Build client UDP address from DNS source IP and configured port
-                                    let client_udp_port = config.client_udp_port.unwrap_or(5353);
-                                    let client_udp_addr = SocketAddr::new(dns_source.ip(), client_udp_port);
-                                    
-                                    let mut packet_map = packet_to_client_udp.lock().await;
-                                    packet_map.insert(packet.packet_id, client_udp_addr);
                                 }
 
                                 // Reassemble packet
@@ -228,13 +231,31 @@ async fn main() -> Result<()> {
                                 if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
                                     info!("Reassembled packet {} ({} bytes)", packet.packet_id, reassembled_data.len());
 
+                                    // Build client UDP address from DNS source IP and configured port
+                                    let client_udp_port = config.client_udp_port.unwrap_or(5353);
+                                    let client_udp_addr = SocketAddr::new(dns_source.ip(), client_udp_port);
+
                                     // Forward to target UDP
                                     if let Some(ref target_sock) = target_socket {
                                         if let Some(target_addr) = config.target_udp {
+                                            // Compute hash of data to match response later
+                                            let mut hasher = DefaultHasher::new();
+                                            reassembled_data.hash(&mut hasher);
+                                            let data_hash = hasher.finish();
+                                            
+                                            // Store mapping: data_hash -> (packet_id, client_udp_addr)
+                                            {
+                                                let mut hash_map = data_hash_to_packet.lock().await;
+                                                hash_map.insert(data_hash, (packet.packet_id, client_udp_addr, Instant::now()));
+                                            }
+                                            
                                             if let Err(e) = target_sock.send_to(&reassembled_data, target_addr).await {
                                                 error!("Failed to forward packet to target: {}", e);
+                                                // Remove from hash map on error
+                                                let mut hash_map = data_hash_to_packet.lock().await;
+                                                hash_map.remove(&data_hash);
                                             } else {
-                                                info!("Forwarded packet to {}", target_addr);
+                                                info!("Forwarded packet {} (hash: {}) to {}", packet.packet_id, data_hash, target_addr);
                                             }
                                         }
                                     } else {

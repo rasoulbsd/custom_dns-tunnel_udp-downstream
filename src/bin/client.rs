@@ -24,9 +24,9 @@ use tokio::time::{sleep, Duration};
 struct Args {
     #[arg(short, long)]
     config: Option<String>,
-    #[arg(short, long, default_value = "127.0.0.1")]
+    #[arg(short = 'a', long, default_value = "127.0.0.1")]
     local_addr: String,
-    #[arg(short, long)]
+    #[arg(short = 'p', long)]
     local_port: Option<u16>,
     #[arg(short, long)]
     domains: Vec<String>,
@@ -212,7 +212,8 @@ async fn main() -> Result<()> {
 
                     // Select domain and resolver
                     let domain = &config.domains[rand::thread_rng().gen_range(0..config.domains.len())];
-                    let resolver = if config.rotate_resolvers {
+                    // Note: resolver selection is computed but we send to all resolvers (spam mode)
+                    let _resolver = if config.rotate_resolvers {
                         let mut idx = resolver_index.lock().await;
                         *idx = (*idx + 1) % config.resolvers.len();
                         rotate_resolver(&config.resolvers, *idx)
