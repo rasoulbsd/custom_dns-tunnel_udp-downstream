@@ -58,6 +58,9 @@ async fn send_tcp_response_via_udp(
     let fragments = fragment_packet(&tcp_data, max_chunk);
     let total_fragments = fragments.len() as u8;
     
+    info!("Sending TCP response via UDP: connection_id={}, packet_id={}, {} fragments to {}", 
+          tcp_packet.connection_id, packet_id, total_fragments, client_addr);
+    
     for (fragment_id, fragment_data) in fragments.iter().enumerate() {
         let udp_packet = codec.encode_udp_packet(
             fragment_data,
@@ -67,9 +70,11 @@ async fn send_tcp_response_via_udp(
         );
         
         if let Err(e) = client_socket.send_to(&udp_packet, client_addr).await {
-            warn!("Failed to send TCP response via UDP: {}", e);
+            warn!("Failed to send TCP response fragment {}/{} via UDP to {}: {}", 
+                  fragment_id + 1, total_fragments, client_addr, e);
         } else {
-            debug!("Sent TCP response fragment {}/{} via UDP", fragment_id + 1, total_fragments);
+            info!("Sent TCP response fragment {}/{} ({} bytes) via UDP to {}", 
+                  fragment_id + 1, total_fragments, udp_packet.len(), client_addr);
         }
     }
 }
@@ -415,6 +420,7 @@ async fn main() -> Result<()> {
                                                         
                                                         match TcpStream::connect(tcp_target).await {
                                                             Ok(stream) => {
+                                                                info!("Successfully connected to TCP target {} for connection {}", tcp_target, tcp_packet.connection_id);
                                                                 let stream = Arc::new(Mutex::new(stream));
                                                                 {
                                                                     let mut streams = tcp_streams.lock().await;
@@ -431,6 +437,7 @@ async fn main() -> Result<()> {
                                                                 
                                                                 // Send SYN-ACK
                                                                 let syn_ack = create_tcp_syn_ack_packet(tcp_packet.connection_id, 1);
+                                                                info!("Sending SYN-ACK for connection {} via UDP to {}", tcp_packet.connection_id, client_udp_addr);
                                                                 send_tcp_response_via_udp(
                                                                     &codec,
                                                                     &client_response_socket,

@@ -111,8 +111,8 @@ async fn handle_tcp_connection(
     tcp_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<TcpStream>>>>>,
     pending_tcp_requests: Arc<Mutex<HashMap<u16, u32>>>,
     resolver_index: Arc<Mutex<usize>>,
+    tcp_packet_id_counter: Arc<Mutex<u16>>,
 ) {
-    let mut packet_id_counter = 0u16;
     let mut buf = vec![0u8; 8192];
     let mut established = false;
     
@@ -161,9 +161,13 @@ async fn handle_tcp_connection(
                 
                 let fin_data = fin_packet.serialize();
                 let packet_id = {
-                    let mut counter = packet_id_counter;
-                    packet_id_counter = packet_id_counter.wrapping_add(1);
-                    counter
+                    let mut counter = tcp_packet_id_counter.lock().await;
+                    let id = *counter;
+                    *counter = counter.wrapping_add(1);
+                    if *counter == 0 {
+                        *counter = 1; // Skip 0 to avoid conflicts
+                    }
+                    id
                 };
                 
                 {
@@ -200,9 +204,13 @@ async fn handle_tcp_connection(
                 
                 let packet_data = tcp_packet.serialize();
                 let packet_id = {
-                    let mut counter = packet_id_counter;
-                    packet_id_counter = packet_id_counter.wrapping_add(1);
-                    counter
+                    let mut counter = tcp_packet_id_counter.lock().await;
+                    let id = *counter;
+                    *counter = counter.wrapping_add(1);
+                    if *counter == 0 {
+                        *counter = 1; // Skip 0 to avoid conflicts
+                    }
+                    id
                 };
                 
                 {
@@ -329,6 +337,7 @@ async fn main() -> Result<()> {
     let tcp_connections: Arc<Mutex<TcpConnectionManager>> = Arc::new(Mutex::new(TcpConnectionManager::new()));
     let tcp_streams: Arc<Mutex<HashMap<u32, Arc<Mutex<TcpStream>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let resolver_index = Arc::new(Mutex::new(0usize));
+    let tcp_packet_id_counter: Arc<Mutex<u16>> = Arc::new(Mutex::new(1u16)); // Start at 1 to avoid 0
 
     // Start TCP listener if configured
     if let Some(tcp_listen_addr) = config.tcp_listen {
@@ -344,7 +353,7 @@ async fn main() -> Result<()> {
         let tcp_streams_clone = tcp_streams.clone();
         let pending_tcp_requests_clone = pending_tcp_requests.clone();
         let resolver_index_clone = resolver_index.clone();
-        let mut packet_id_counter_tcp = 0u16;
+        let tcp_packet_id_counter_clone = tcp_packet_id_counter.clone();
         
         tokio::spawn(async move {
             loop {
@@ -367,9 +376,13 @@ async fn main() -> Result<()> {
                         let syn_data = syn_packet.serialize();
                         
                         let packet_id = {
-                            let mut counter = packet_id_counter_tcp;
-                            packet_id_counter_tcp = packet_id_counter_tcp.wrapping_add(1);
-                            counter
+                            let mut counter = tcp_packet_id_counter_clone.lock().await;
+                            let id = *counter;
+                            *counter = counter.wrapping_add(1);
+                            if *counter == 0 {
+                                *counter = 1; // Skip 0 to avoid conflicts
+                            }
+                            id
                         };
                         
                         {
@@ -395,6 +408,7 @@ async fn main() -> Result<()> {
                         let tcp_strs = tcp_streams_clone.clone();
                         let pending_tcp = pending_tcp_requests_clone.clone();
                         let resolver_idx = resolver_index_clone.clone();
+                        let tcp_packet_id_conn = tcp_packet_id_counter_clone.clone();
                         
                         tokio::spawn(async move {
                             handle_tcp_connection(
@@ -407,6 +421,7 @@ async fn main() -> Result<()> {
                                 tcp_strs,
                                 pending_tcp,
                                 resolver_idx,
+                                tcp_packet_id_conn,
                             ).await;
                         });
                     }
@@ -487,8 +502,15 @@ async fn main() -> Result<()> {
                                                 // Send ACK
                                                 let ack_packet = create_tcp_ack_packet(tcp_packet.connection_id, conn.expected_sequence);
                                                 let ack_data = ack_packet.serialize();
-                                                let ack_packet_id = packet_id_counter;
-                                                packet_id_counter = packet_id_counter.wrapping_add(1);
+                                                let ack_packet_id = {
+                                                    let mut counter = tcp_packet_id_counter.lock().await;
+                                                    let id = *counter;
+                                                    *counter = counter.wrapping_add(1);
+                                                    if *counter == 0 {
+                                                        *counter = 1; // Skip 0 to avoid conflicts
+                                                    }
+                                                    id
+                                                };
                                                 
                                                 {
                                                     let mut pending = pending_tcp_requests.lock().await;

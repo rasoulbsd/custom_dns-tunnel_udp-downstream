@@ -58,7 +58,18 @@ impl PacketReassembler {
     pub fn is_tcp_packet(data: &[u8]) -> bool {
         // TCP packet format: [4 bytes: connection_id][4 bytes: sequence][2 bytes: data_length][1 byte: flags][...]
         // Minimum size is 11 bytes
-        data.len() >= 11 && data.len() <= 65507
+        if data.len() < 11 {
+            return false;
+        }
+        
+        // Try to read the data_length field and verify the packet is complete
+        let data_length = u16::from_be_bytes([data[8], data[9]]);
+        let expected_len = 11 + data_length as usize;
+        
+        // Only consider it a TCP packet if it's complete (or at least has the header)
+        // We allow incomplete packets here because they might be in the process of being reassembled
+        // The actual deserialization will check for completeness
+        data.len() >= 11 && expected_len <= 65507
     }
 
     fn cleanup(&mut self) {
