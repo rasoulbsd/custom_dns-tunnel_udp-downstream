@@ -12,6 +12,8 @@ pub struct TunnelPacket {
     pub packet_id: u16,
     pub fragment_id: u8,
     pub total_fragments: u8,
+    /// Indicates if this packet contains TCP data (connection_id embedded in data)
+    pub is_tcp: bool,
 }
 
 #[derive(Debug)]
@@ -50,6 +52,13 @@ impl PacketReassembler {
         } else {
             None
         }
+    }
+    
+    /// Check if reassembled data is a TCP packet (starts with connection_id)
+    pub fn is_tcp_packet(data: &[u8]) -> bool {
+        // TCP packet format: [4 bytes: connection_id][4 bytes: sequence][2 bytes: data_length][1 byte: flags][...]
+        // Minimum size is 11 bytes
+        data.len() >= 11 && data.len() <= 65507
     }
 
     fn cleanup(&mut self) {
