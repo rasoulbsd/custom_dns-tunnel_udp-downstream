@@ -1,5 +1,6 @@
 {
   "local_udp": "127.0.0.1:5355",
+  "tcp_listen": "127.0.0.1:1080",
   "domains": [
     "example.com",
     "tunnel.example.com"
@@ -9,5 +10,6 @@
   ],
   "max_subdomain_length": 64,
   "rotate_resolvers": true,
-  "randomize_local_port": false
+  "randomize_local_port": false,
+  "tcp_connection_timeout": 60
 }

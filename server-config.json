@@ -1,5 +1,6 @@
 {
   "dns_bind": "0.0.0.0:5353",
+  "tcp_target": "127.0.0.1:8388",
   "target_udp": "127.0.0.1:8080",
   "client_udp_port": 5355,
   "domains": [
@@ -7,5 +8,6 @@
     "tunnel.example.com"
   ],
   "max_subdomain_length": 64,
-  "randomize_dns_port": false
+  "randomize_dns_port": false,
+  "tcp_connection_timeout": 60
 }
