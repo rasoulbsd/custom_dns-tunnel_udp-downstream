@@ -386,10 +386,12 @@ async fn main() -> Result<()> {
                                       client_response_socket.is_some(), dns_socket_for_response.is_some());
                                 
                                 // Get reply_addr, query_id and domain from pending_requests
+                                // CRITICAL: For DNS responses, we MUST use the actual DNS query source (with ephemeral port),
+                                // NOT the client_udp_addr from hash_map (which uses client_udp_port=53)
                                 let (reply_addr, query_id, domain) = {
                                     let pending = pending_requests_for_response.lock().await;
                                     if let Some((reply, qid, dom)) = pending.get(&original_packet_id) {
-                                        info!("[DEBUG] Retrieved reply_addr={} for packet_id={} (query_id={})", reply, original_packet_id, qid);
+                                        info!("[TARGET] Retrieved reply_addr={} for packet_id={} (query_id={}) - using this for DNS responses (NOT client_udp_addr={})", reply, original_packet_id, qid, client_udp_addr);
                                         (*reply, *qid, dom.clone())
                                     } else {
                                         warn!("No pending request found for packet_id: {}", original_packet_id);
@@ -662,9 +664,11 @@ async fn main() -> Result<()> {
                                 };
 
                                 // Store pending request for DNS response (if needed)
+                                // CRITICAL: Store the actual DNS query source (with ephemeral port) for DNS responses
+                                // This is required for public resolvers (1.1.1.1, 8.8.8.8) to work correctly
                                 {
                                     let mut pending = pending_requests.lock().await;
-                                    info!("[DEBUG] Storing dns_source={} for packet_id={} (query_id={})", dns_source, packet.packet_id, message.id());
+                                    info!("[DNS-QUERY] Storing reply_addr={} for packet_id={} (query_id={}) - will send DNS responses to this address", dns_source, packet.packet_id, message.id());
                                     pending.insert(packet.packet_id, (dns_source, message.id(), domain));
                                 }
 
