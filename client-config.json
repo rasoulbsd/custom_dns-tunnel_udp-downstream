@@ -1,14 +1,17 @@
 {
   "local_udp": "127.0.0.1:5355",
+  "uplink_mode": "dns/udp",
   "response_mode": "udp/dns",
+  "server_udp_addr": "127.0.0.1:5354",
   "domains": [
     "us.meonme.ir"
   ],
   "resolvers": [
-    "1.1.1.1:53"
+    "127.0.0.1:53533"
   ],
-  "max_subdomain_length": 200,
+  "max_subdomain_length": 100,
   "min_subdomain_length": 60,
   "rotate_resolvers": true,
-  "randomize_local_port": false
+  "randomize_local_port": false,
+  "plain_mode": false
 }

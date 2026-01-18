@@ -8,6 +8,7 @@ use rand::Rng;
 
 pub struct DnsCodec {
     max_subdomain_length: usize,
+    #[allow(dead_code)] // Used in smart fragmentation calculation
     min_subdomain_length: usize,
     max_payload_per_query: usize,
 }
@@ -20,7 +21,11 @@ impl DnsCodec {
     pub fn new_with_min(max_subdomain_length: usize, min_subdomain_length: usize) -> Self {
         // DNS label limit is 63 bytes (RFC 1035)
         // Cap at 63 to ensure DNS compatibility
+        let original_max = max_subdomain_length;
         let max_subdomain_length = max_subdomain_length.min(63);
+        if original_max > 63 {
+            log::warn!("max_subdomain_length ({}) exceeds DNS label limit (63), capped to 63", original_max);
+        }
         let min_subdomain_length = min_subdomain_length.min(max_subdomain_length);
         
         // Calculate max payload per query
@@ -33,18 +38,33 @@ impl DnsCodec {
         //          payload + 4 <= 31
         //          payload <= 27
         // To ensure even hex length: 27 bytes payload = 54 hex chars, + 8 hex chars header = 62 hex chars (fits in 63)
-        let max_total_bytes = max_subdomain_length / 2; // Max bytes that fit in subdomain (63/2 = 31)
+        let max_total_bytes = max_subdomain_length / 2; // Max bytes that fit in subdomain
         let header_size = 4; // packet_id (2) + fragment_id (1) + total_fragments (1)
         let max_payload = if max_total_bytes > header_size {
-            max_total_bytes - header_size // 31 - 4 = 27 bytes
+            max_total_bytes - header_size
         } else {
             0
-        }.max(16); // Minimum 16 bytes
+        };
+        
+        // Smart fragmentation: if min_subdomain_length is set, use it to determine preferred chunk size
+        // This ensures we fragment to efficiently use available space rather than padding with zeros
+        let preferred_payload = if min_subdomain_length > 0 {
+            let min_total_bytes = (min_subdomain_length / 2).max(header_size);
+            let min_payload = if min_total_bytes > header_size {
+                min_total_bytes - header_size
+            } else {
+                16 // Minimum reasonable payload
+            };
+            // Use the larger of: min_payload (from min_subdomain_length) or 16, but cap at max_payload
+            min_payload.max(16).min(max_payload.max(16))
+        } else {
+            max_payload.max(16) // Minimum 16 bytes
+        };
         
         Self {
             max_subdomain_length,
             min_subdomain_length,
-            max_payload_per_query: max_payload,
+            max_payload_per_query: preferred_payload,
         }
     }
 
@@ -65,22 +85,10 @@ impl DnsCodec {
         packet_data.extend_from_slice(data);
 
         // Encode to hex (case insensitive, lowercase for consistency)
-        let mut encoded = hex::encode(&packet_data);
-        
-        // Ensure subdomain meets minimum length (pad if needed)
-        if encoded.len() < self.min_subdomain_length {
-            // Pad with zeros (hex '0' characters) to meet minimum
-            let padding_needed = self.min_subdomain_length - encoded.len();
-            // Ensure padding is even (hex encoding requires even length)
-            let padding = if padding_needed % 2 == 1 {
-                padding_needed + 1
-            } else {
-                padding_needed
-            };
-            encoded.extend(std::iter::repeat('0').take(padding));
-        }
+        let encoded = hex::encode(&packet_data);
         
         // Ensure subdomain doesn't exceed max length
+        // Smart fragmentation: we fragment packets to efficiently use space, no zero padding needed
         // DNS label limit is 63 bytes (RFC 1035)
         // Hex encoding always produces even length (1 byte = 2 hex chars)
         // But we need to ensure truncation is to even length if needed
@@ -232,11 +240,6 @@ impl DnsCodec {
             log::debug!("decode_udp_packet: Invalid fragment_id {} >= total_fragments {}", fragment_id, total_fragments);
             return Ok(None); // Invalid - fragment_id out of range
         }
-        // Additional check: packet_id should not be 0 (unlikely to be valid)
-        if packet_id == 0 {
-            log::debug!("decode_udp_packet: Invalid packet_id: 0");
-            return Ok(None); // Invalid - packet_id 0 is reserved/unlikely
-        }
         
         let packet_data = data[4..].to_vec();
 
@@ -268,20 +271,7 @@ impl DnsCodec {
         packet_data.extend_from_slice(data);
 
         // Encode to hex (case insensitive, lowercase for consistency)
-        let mut encoded = hex::encode(&packet_data);
-        
-        // Ensure subdomain meets minimum length (pad if needed)
-        if encoded.len() < self.min_subdomain_length {
-            // Pad with zeros (hex '0' characters) to meet minimum
-            let padding_needed = self.min_subdomain_length - encoded.len();
-            // Ensure padding is even (hex encoding requires even length)
-            let padding = if padding_needed % 2 == 1 {
-                padding_needed + 1
-            } else {
-                padding_needed
-            };
-            encoded.extend(std::iter::repeat('0').take(padding));
-        }
+        let encoded = hex::encode(&packet_data);
         
         // Ensure subdomain doesn't exceed max length
         let max_len = self.max_subdomain_length.min(63);
@@ -320,6 +310,15 @@ impl DnsCodec {
 
     /// Decode DNS response to extract UDP packet data
     pub fn decode_from_dns_response(&self, message: &Message, expected_domains: &[String]) -> Result<Option<TunnelPacket>> {
+        // #region agent log
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/.cursor/debug.log") {
+            let _ = writeln!(f, r#"{{"hypothesisId":"D2","location":"dns_codec.rs:312","message":"decode_dns_response_entry","data":{{"msg_type":"{:?}","answers_count":{},"queries_count":{},"expected_domains":"{:?}"}},"timestamp":{}}}"#, 
+                message.message_type(), message.answers().len(), message.queries().len(), expected_domains,
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+        }
+        // #endregion
+        
         // Check if this is a response
         if message.message_type() != MessageType::Response {
             return Ok(None);
@@ -327,6 +326,13 @@ impl DnsCodec {
 
         // Try to extract from TXT record in answers
         for answer in message.answers() {
+            // #region agent log
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/.cursor/debug.log") {
+                let _ = writeln!(f, r#"{{"hypothesisId":"D2","location":"dns_codec.rs:325","message":"checking_answer","data":{{"record_type":"{:?}","name":"{}"}},"timestamp":{}}}"#, 
+                    answer.record_type(), answer.name().to_ascii(),
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+            }
+            // #endregion
             if answer.record_type() == RecordType::TXT {
                 let name = answer.name().to_ascii();
                 let name_str = name.trim_end_matches('.');
@@ -336,6 +342,13 @@ impl DnsCodec {
                     (name_str.ends_with(&format!(".{}", domain)) || name_str == domain.as_str())
                         && name_str.len() > domain.len()
                 });
+                // #region agent log
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/.cursor/debug.log") {
+                    let _ = writeln!(f, r#"{{"hypothesisId":"D2","location":"dns_codec.rs:340","message":"domain_match_check","data":{{"name_str":"{}","domain_match":{}}},"timestamp":{}}}"#, 
+                        name_str, domain_match,
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+                }
+                // #endregion
 
                 if domain_match {
                     // Extract subdomain

@@ -1,13 +1,15 @@
 {
   "dns_bind": "0.0.0.0:53533",
+  "udp_query_port": 5354,
   "target_udp": "127.0.0.1:8080",
   "client_udp_port": 5355,
-  "response_mode": "udp",
+  "response_mode": "udp/dns",
   "domains": [
     "example.com",
     "us.meonme.ir"
   ],
-  "max_subdomain_length": 63,
-  "min_subdomain_length": 0,
-  "randomize_dns_port": false
+  "max_subdomain_length": 100,
+  "min_subdomain_length": 60,
+  "randomize_dns_port": false,
+  "plain_mode": false
 }
