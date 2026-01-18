@@ -389,6 +389,7 @@ async fn main() -> Result<()> {
                                 let (reply_addr, query_id, domain) = {
                                     let pending = pending_requests_for_response.lock().await;
                                     if let Some((reply, qid, dom)) = pending.get(&original_packet_id) {
+                                        info!("[DEBUG] Retrieved reply_addr={} for packet_id={} (query_id={})", reply, original_packet_id, qid);
                                         (*reply, *qid, dom.clone())
                                     } else {
                                         warn!("No pending request found for packet_id: {}", original_packet_id);
@@ -663,6 +664,7 @@ async fn main() -> Result<()> {
                                 // Store pending request for DNS response (if needed)
                                 {
                                     let mut pending = pending_requests.lock().await;
+                                    info!("[DEBUG] Storing dns_source={} for packet_id={} (query_id={})", dns_source, packet.packet_id, message.id());
                                     pending.insert(packet.packet_id, (dns_source, message.id(), domain));
                                 }
 
