@@ -391,10 +391,10 @@ async fn main() -> Result<()> {
                                 let (reply_addr, query_id, domain) = {
                                     let pending = pending_requests_for_response.lock().await;
                                     if let Some((reply, qid, dom)) = pending.get(&original_packet_id) {
-                                        error!("[TARGET] Retrieved reply_addr={} for packet_id={} (query_id={}) - using this for DNS responses (NOT client_udp_addr={})", reply, original_packet_id, qid, client_udp_addr);
+                                        debug!("[TARGET] Retrieved reply_addr={} for packet_id={} (query_id={}) - using this for DNS responses (NOT client_udp_addr={})", reply, original_packet_id, qid, client_udp_addr);
                                         (*reply, *qid, dom.clone())
                                     } else {
-                                        error!("[TARGET] No pending request found for packet_id: {} (pending_requests keys: {:?})", original_packet_id, pending.keys().collect::<Vec<_>>());
+                                        warn!("[TARGET] No pending request found for packet_id: {} (pending_requests keys: {:?})", original_packet_id, pending.keys().collect::<Vec<_>>());
                                         continue;
                                     }
                                 };
@@ -474,7 +474,7 @@ async fn main() -> Result<()> {
                                                             
                                                             // IMPORTANT: reply to the DNS query source (resolver/client IP:port),
                                                             // not to client_udp_port. This is required for public resolvers to work.
-                                                            info!("[DNS-RESPONSE] About to send to reply_addr={} (packet_id={}, fragment={}/{})", reply_addr, response_packet_id, fragment_id + 1, total_fragments);
+                                                            debug!("[DNS-RESPONSE] About to send to reply_addr={} (packet_id={}, fragment={}/{})", reply_addr, response_packet_id, fragment_id + 1, total_fragments);
                                                             if let Err(e) = sock.send_to(&response_bytes, reply_addr).await {
                                                                 warn!("Failed to send DNS response to {}: {}", reply_addr, e);
                                                             } else {
@@ -669,7 +669,7 @@ async fn main() -> Result<()> {
                                 // This is required for public resolvers (1.1.1.1, 8.8.8.8) to work correctly
                                 {
                                     let mut pending = pending_requests.lock().await;
-                                    error!("[DNS-QUERY] Storing reply_addr={} for packet_id={} (query_id={}) - will send DNS responses to this address", dns_source, packet.packet_id, message.id());
+                                    debug!("[DNS-QUERY] Storing reply_addr={} for packet_id={} (query_id={}) - will send DNS responses to this address", dns_source, packet.packet_id, message.id());
                                     pending.insert(packet.packet_id, (dns_source, message.id(), domain));
                                 }
 
