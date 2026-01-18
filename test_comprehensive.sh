@@ -34,7 +34,7 @@ run_test() {
         echo -e "${RED}✗ FAILED: $test_name${NC}"
         TESTS_FAILED=$(($TESTS_FAILED + 1))
     fi
-    echo ""
+echo ""
 }
 
 # Test 1: Basic connectivity
@@ -75,7 +75,7 @@ if command -v python3 &> /dev/null && [ -f "test_image_transfer.py" ]; then
     # Check if PIL is available
     if python3 -c "from PIL import Image" 2>/dev/null; then
         run_test "Image Transfer (50KB)" "python3 test_image_transfer.py 50"
-    else
+else
         echo -e "${YELLOW}⚠ Skipping: PIL/Pillow not installed${NC}"
         echo "  Install with: pip3 install Pillow"
     fi

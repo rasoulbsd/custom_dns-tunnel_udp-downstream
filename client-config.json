@@ -1,6 +1,6 @@
 {
   "local_udp": "127.0.0.1:5355",
-  "response_mode": "udp",
+  "response_mode": "udp/dns",
   "domains": [
     "us.meonme.ir"
   ],

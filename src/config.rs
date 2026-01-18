@@ -7,9 +7,16 @@ pub enum ResponseMode {
     /// Use DNS responses for downlink (full DNS tunnel)
     #[serde(rename = "dns")]
     Dns,
-    /// Use direct UDP for downlink (hybrid mode)
+    /// Use direct UDP for downlink
     #[serde(rename = "udp")]
     Udp,
+    /// Use both UDP and DNS responses (hybrid mode - best performance and reliability)
+    #[serde(rename = "hybrid")]
+    Hybrid,
+    /// Alias for hybrid mode
+    #[serde(rename = "udp/dns")]
+    #[serde(alias = "dns/udp")]
+    HybridAlias,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,7 +25,7 @@ pub struct ClientConfig {
     pub local_udp: SocketAddr,
     /// UDP port for receiving responses from server (default: same as local_udp port)
     pub response_udp_port: Option<u16>,
-    /// Response mode: "dns" for full DNS tunnel, "udp" for direct UDP downlink
+    /// Response mode: "dns" (DNS only), "udp" (UDP only), or "hybrid" (both UDP and DNS)
     #[serde(default = "default_response_mode")]
     pub response_mode: ResponseMode,
     /// List of domains to use for DNS queries
@@ -63,7 +70,7 @@ pub struct ServerConfig {
     pub target_udp: Option<SocketAddr>,
     /// Client UDP port for sending responses (uses DNS query source IP, only used in UDP mode)
     pub client_udp_port: Option<u16>,
-    /// Response mode: "dns" for full DNS tunnel, "udp" for direct UDP downlink
+    /// Response mode: "dns" (DNS only), "udp" (UDP only), or "hybrid" (both UDP and DNS)
     #[serde(default = "default_response_mode")]
     pub response_mode: ResponseMode,
     /// List of domains to listen for

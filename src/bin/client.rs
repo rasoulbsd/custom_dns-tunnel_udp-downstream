@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
     }
     config.rotate_resolvers = !args.no_rotate_resolvers;
     config.randomize_local_port = args.randomize_local_port;
-    
+
     // Note: min_subdomain_length and response_mode should be set in config file
 
     // Set local UDP address and port
@@ -77,13 +77,13 @@ async fn main() -> Result<()> {
     // Check if user provided CLI args (not just defaults)
     let local_udp: SocketAddr = if args.local_port.is_some() {
         // User provided port via CLI, use CLI args
-        let local_port = if config.randomize_local_port {
-            get_random_port()
-        } else {
-            args.local_port.unwrap_or_else(|| {
-                config.local_udp.port()
-            })
-        };
+    let local_port = if config.randomize_local_port {
+        get_random_port()
+    } else {
+        args.local_port.unwrap_or_else(|| {
+            config.local_udp.port()
+        })
+    };
         format!("{}:{}", args.local_addr, local_port)
             .parse()
             .context("Invalid local UDP address")?
@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
         if config.randomize_local_port {
             let port = get_random_port();
             format!("{}:{}", config.local_udp.ip(), port)
-                .parse()
+        .parse()
                 .context("Invalid local UDP address")?
         } else {
             // Use config's address and port directly (this respects 0.0.0.0 from config)
@@ -100,13 +100,13 @@ async fn main() -> Result<()> {
         }
     };
 
-    info!("Starting DNS Tunnel Client (Hybrid Mode)");
+    info!("Starting DNS Tunnel Client");
     info!("Local UDP: {}", local_udp);
     info!("Domains: {:?}", config.domains);
     info!("Resolvers: {:?}", config.resolvers);
     info!("Max subdomain length: {}", config.max_subdomain_length);
     info!("Min subdomain length: {}", config.min_subdomain_length);
-    info!("Response mode: Hybrid (listening for both UDP and DNS responses)");
+    info!("Response mode: {:?}", config.response_mode);
     info!("Resolver rotation: {}", config.rotate_resolvers);
 
     if config.domains.is_empty() {
@@ -134,16 +134,17 @@ async fn main() -> Result<()> {
     let pending_requests: Arc<Mutex<HashMap<u16, (SocketAddr, u16)>>> = Arc::new(Mutex::new(HashMap::new()));
     let resolver_index = Arc::new(Mutex::new(0usize));
 
-    // Spawn task to receive DNS responses (hybrid mode: always listen for DNS responses)
+    // Spawn task to receive DNS responses (if DNS or hybrid mode)
     // Client processes whichever arrives first (DNS or UDP) for better performance and redundancy
-    let dns_socket = dns_query_socket.clone();
-    let codec_dns = codec.clone();
-    let reassembler_dns = reassembler.clone();
-    let pending_requests_dns = pending_requests.clone();
-    let udp_socket_dns = udp_socket.clone();
-    let domains = config.domains.clone();
-    
-    tokio::spawn(async move {
+    if matches!(config.response_mode, ResponseMode::Dns | ResponseMode::Hybrid | ResponseMode::HybridAlias) {
+        let dns_socket = dns_query_socket.clone();
+        let codec_dns = codec.clone();
+        let reassembler_dns = reassembler.clone();
+        let pending_requests_dns = pending_requests.clone();
+        let udp_socket_dns = udp_socket.clone();
+        let domains = config.domains.clone();
+        
+        tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
             match dns_socket.recv_from(&mut buf).await {
@@ -195,7 +196,8 @@ async fn main() -> Result<()> {
                 }
             }
         }
-    });
+        });
+    }
 
     // Main loop: receive packets and handle both local UDP and DNS responses
     let mut buf = vec![0u8; 65535];
