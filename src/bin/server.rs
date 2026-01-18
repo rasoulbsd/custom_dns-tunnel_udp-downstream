@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use dns_tunnel::{
-    config::{load_server_config, ServerConfig},
+    config::{load_server_config, ResponseMode, ServerConfig},
     dns_codec::DnsCodec,
     packet::{fragment_packet, PacketReassembler},
     utils::get_random_port,
@@ -99,9 +99,9 @@ async fn main() -> Result<()> {
     }
 
     // Bind DNS socket
-    let dns_socket = UdpSocket::bind(&dns_bind)
+    let dns_socket = Arc::new(UdpSocket::bind(&dns_bind)
         .await
-        .context("Failed to bind DNS socket")?;
+        .context("Failed to bind DNS socket")?);
     info!("Bound to DNS: {}", dns_bind);
 
     // Create target UDP socket if specified
@@ -113,10 +113,10 @@ async fn main() -> Result<()> {
         None
     };
 
-    let codec = Arc::new(DnsCodec::new(config.max_subdomain_length));
+    let codec = Arc::new(DnsCodec::new_with_min(config.max_subdomain_length, config.min_subdomain_length));
     let reassembler = Arc::new(Mutex::new(PacketReassembler::new()));
-    // Map: packet_id -> (dns_source, query_id)
-    let pending_requests: Arc<Mutex<HashMap<u16, (SocketAddr, u16)>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Map: packet_id -> (dns_source, query_id, domain)
+    let pending_requests: Arc<Mutex<HashMap<u16, (SocketAddr, u16, String)>>> = Arc::new(Mutex::new(HashMap::new()));
     // Queue for matching responses from target_udp to packet_id
     // For echo servers: we can use hash-based matching (exact data match)
     // For real services (OpenVPN, etc): we use FIFO queue (responses come in order)
@@ -125,10 +125,17 @@ async fn main() -> Result<()> {
     // FIFO queue for non-echo services: (packet_id, client_udp_addr, timestamp, data_hash)
     let response_queue: Arc<Mutex<VecDeque<(u16, SocketAddr, Instant, u64)>>> = Arc::new(Mutex::new(VecDeque::new()));
     
-    // Create a UDP socket for sending responses directly to client
-    let client_response_socket = Arc::new(UdpSocket::bind("0.0.0.0:0")
-        .await
-        .context("Failed to bind client response UDP socket")?);
+    // Create a UDP socket for sending responses directly to client (only used in UDP mode)
+    let client_response_socket = if matches!(config.response_mode, ResponseMode::Udp) {
+        Some(Arc::new(UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("Failed to bind client response UDP socket")?))
+    } else {
+        None
+    };
+    
+    // Clone DNS socket for sending DNS responses (used in DNS mode)
+    let dns_socket_for_response = dns_socket.clone();
 
     // Spawn task to receive UDP responses from target
     if let Some(ref target_sock) = target_socket {
@@ -136,8 +143,12 @@ async fn main() -> Result<()> {
             let target_sock = target_sock.clone();
             let codec = codec.clone();
             let client_response_socket = client_response_socket.clone();
+            let dns_socket_for_response = dns_socket_for_response.clone();
+            let response_mode = config.response_mode.clone();
+            let domains = config.domains.clone();
             let data_hash_to_packet = data_hash_to_packet.clone();
             let response_queue = response_queue.clone();
+            let pending_requests_for_response = pending_requests.clone();
             
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65507];
@@ -179,29 +190,81 @@ async fn main() -> Result<()> {
                                 info!("Matched target response to packet_id: {}, sending to {}", 
                                       original_packet_id, client_udp_addr);
                                 
-                                // Fragment and encode as UDP packets (not DNS)
-                                let max_chunk = 65507 - 4; // Max UDP size minus header
+                                // Get query_id and domain from pending_requests
+                                let (query_id, domain) = {
+                                    let pending = pending_requests_for_response.lock().await;
+                                    if let Some((_, qid, dom)) = pending.get(&original_packet_id) {
+                                        (*qid, dom.clone())
+                                    } else {
+                                        warn!("No pending request found for packet_id: {}", original_packet_id);
+                                        continue;
+                                    }
+                                };
+                                
+                                // Fragment response
+                                let max_chunk = match response_mode {
+                                    ResponseMode::Dns => codec.max_payload_per_query(),
+                                    ResponseMode::Udp => 65507 - 4, // Max UDP size minus header
+                                };
                                 let fragments = fragment_packet(data, max_chunk);
                                 let total_fragments = fragments.len() as u8;
                                 
-                                info!("Fragmenting response into {} fragments", total_fragments);
+                                info!("Fragmenting response into {} fragments (mode: {:?})", total_fragments, response_mode);
                                 
                                 // Use the ORIGINAL packet_id so client can match it
                                 let response_packet_id = original_packet_id;
 
                                 for (fragment_id, fragment_data) in fragments.iter().enumerate() {
-                                    let udp_packet = codec.encode_udp_packet(
-                                        fragment_data,
-                                        response_packet_id,
-                                        fragment_id as u8,
-                                        total_fragments,
-                                    );
-                                    
-                                    if let Err(e) = client_response_socket.send_to(&udp_packet, client_udp_addr).await {
-                                        warn!("Failed to send UDP response: {}", e);
-                                    } else {
-                                        info!("Sent UDP response fragment {}/{} ({} bytes) to {}", 
-                                               fragment_id + 1, total_fragments, udp_packet.len(), client_udp_addr);
+                                    match response_mode {
+                                        ResponseMode::Dns => {
+                                            // Send as DNS response
+                                            match codec.encode_to_dns_response(
+                                                fragment_data,
+                                                &domain,
+                                                response_packet_id,
+                                                fragment_id as u8,
+                                                total_fragments,
+                                                query_id,
+                                            ) {
+                                                Ok(dns_response) => {
+                                                    let mut buf = Vec::new();
+                                                    let mut encoder = BinEncoder::new(&mut buf);
+                                                    if let Err(e) = dns_response.emit(&mut encoder) {
+                                                        warn!("Failed to encode DNS response: {}", e);
+                                                        continue;
+                                                    }
+                                                    let response_bytes = encoder.into_bytes();
+                                                    
+                                                    if let Err(e) = dns_socket_for_response.send_to(&response_bytes, client_udp_addr).await {
+                                                        warn!("Failed to send DNS response: {}", e);
+                                                    } else {
+                                                        info!("Sent DNS response fragment {}/{} ({} bytes) to {}", 
+                                                               fragment_id + 1, total_fragments, response_bytes.len(), client_udp_addr);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to encode DNS response: {}", e);
+                                                }
+                                            }
+                                        }
+                                        ResponseMode::Udp => {
+                                            // Send as UDP packet
+                                            if let Some(ref sock) = client_response_socket {
+                                                let udp_packet = codec.encode_udp_packet(
+                                                    fragment_data,
+                                                    response_packet_id,
+                                                    fragment_id as u8,
+                                                    total_fragments,
+                                                );
+                                                
+                                                if let Err(e) = sock.send_to(&udp_packet, client_udp_addr).await {
+                                                    warn!("Failed to send UDP response: {}", e);
+                                                } else {
+                                                    info!("Sent UDP response fragment {}/{} ({} bytes) to {}", 
+                                                           fragment_id + 1, total_fragments, udp_packet.len(), client_udp_addr);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             } else {
@@ -237,10 +300,22 @@ async fn main() -> Result<()> {
                                 info!("Decoded DNS query from {}: packet_id={}, fragment={}/{}", 
                                        dns_source, packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
 
+                                // Extract domain from query for DNS responses
+                                let domain = if let Some(query) = message.queries().first() {
+                                    let query_name = query.name().to_ascii().trim_end_matches('.').to_string();
+                                    // Find matching domain
+                                    config.domains.iter()
+                                        .find(|d| query_name.ends_with(d.as_str()))
+                                        .cloned()
+                                        .unwrap_or_else(|| config.domains[0].clone())
+                                } else {
+                                    config.domains[0].clone()
+                                };
+
                                 // Store pending request for DNS response (if needed)
                                 {
                                     let mut pending = pending_requests.lock().await;
-                                    pending.insert(packet.packet_id, (dns_source, message.id()));
+                                    pending.insert(packet.packet_id, (dns_source, message.id(), domain));
                                 }
 
                                 // Reassemble packet

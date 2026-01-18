@@ -8,14 +8,20 @@ use rand::Rng;
 
 pub struct DnsCodec {
     max_subdomain_length: usize,
+    min_subdomain_length: usize,
     max_payload_per_query: usize,
 }
 
 impl DnsCodec {
     pub fn new(max_subdomain_length: usize) -> Self {
+        Self::new_with_min(max_subdomain_length, 0)
+    }
+    
+    pub fn new_with_min(max_subdomain_length: usize, min_subdomain_length: usize) -> Self {
         // DNS label limit is 63 bytes (RFC 1035)
         // Cap at 63 to ensure DNS compatibility
         let max_subdomain_length = max_subdomain_length.min(63);
+        let min_subdomain_length = min_subdomain_length.min(max_subdomain_length);
         
         // Calculate max payload per query
         // We need to account for:
@@ -37,6 +43,7 @@ impl DnsCodec {
         
         Self {
             max_subdomain_length,
+            min_subdomain_length,
             max_payload_per_query: max_payload,
         }
     }
@@ -58,7 +65,20 @@ impl DnsCodec {
         packet_data.extend_from_slice(data);
 
         // Encode to hex (case insensitive, lowercase for consistency)
-        let encoded = hex::encode(&packet_data);
+        let mut encoded = hex::encode(&packet_data);
+        
+        // Ensure subdomain meets minimum length (pad if needed)
+        if encoded.len() < self.min_subdomain_length {
+            // Pad with zeros (hex '0' characters) to meet minimum
+            let padding_needed = self.min_subdomain_length - encoded.len();
+            // Ensure padding is even (hex encoding requires even length)
+            let padding = if padding_needed % 2 == 1 {
+                padding_needed + 1
+            } else {
+                padding_needed
+            };
+            encoded.extend(std::iter::repeat('0').take(padding));
+        }
         
         // Ensure subdomain doesn't exceed max length
         // DNS label limit is 63 bytes (RFC 1035)
@@ -228,6 +248,130 @@ impl DnsCodec {
             fragment_id,
             total_fragments,
         }))
+    }
+
+    /// Encode UDP packet data into DNS response
+    pub fn encode_to_dns_response(
+        &self,
+        data: &[u8],
+        domain: &str,
+        packet_id: u16,
+        fragment_id: u8,
+        total_fragments: u8,
+        query_id: u16,
+    ) -> Result<Message> {
+        // Create packet header: packet_id (2 bytes) + fragment_id (1) + total_fragments (1) + data
+        let mut packet_data = Vec::with_capacity(4 + data.len());
+        packet_data.extend_from_slice(&packet_id.to_be_bytes());
+        packet_data.push(fragment_id);
+        packet_data.push(total_fragments);
+        packet_data.extend_from_slice(data);
+
+        // Encode to hex (case insensitive, lowercase for consistency)
+        let mut encoded = hex::encode(&packet_data);
+        
+        // Ensure subdomain meets minimum length (pad if needed)
+        if encoded.len() < self.min_subdomain_length {
+            // Pad with zeros (hex '0' characters) to meet minimum
+            let padding_needed = self.min_subdomain_length - encoded.len();
+            // Ensure padding is even (hex encoding requires even length)
+            let padding = if padding_needed % 2 == 1 {
+                padding_needed + 1
+            } else {
+                padding_needed
+            };
+            encoded.extend(std::iter::repeat('0').take(padding));
+        }
+        
+        // Ensure subdomain doesn't exceed max length
+        let max_len = self.max_subdomain_length.min(63);
+        let subdomain = if encoded.len() > max_len {
+            let truncate_len = (max_len / 2) * 2;
+            &encoded[..truncate_len]
+        } else {
+            &encoded
+        };
+
+        // Create DNS response
+        let mut message = Message::new();
+        message.set_id(query_id);
+        message.set_message_type(MessageType::Response);
+        message.set_op_code(OpCode::Query);
+        message.set_recursion_desired(true);
+
+        // Build response name: <subdomain>.<domain>
+        let response_name = format!("{}.{}", subdomain, domain);
+        let name = Name::from_ascii(&response_name)
+            .map_err(|e| anyhow!("Failed to create DNS name: {}", e))?;
+
+        // Add TXT record with the subdomain as the response
+        // We use TXT record type for the response
+        use hickory_proto::rr::{rdata::TXT, Record};
+        let mut record = Record::new();
+        record.set_name(name.clone());
+        record.set_record_type(RecordType::TXT);
+        record.set_ttl(0); // No caching
+        // TXT::new expects Vec<String>, where each string is a character string
+        record.set_data(Some(hickory_proto::rr::RData::TXT(TXT::new(vec![subdomain.to_string()]))));
+        message.add_answer(record);
+
+        Ok(message)
+    }
+
+    /// Decode DNS response to extract UDP packet data
+    pub fn decode_from_dns_response(&self, message: &Message, expected_domains: &[String]) -> Result<Option<TunnelPacket>> {
+        // Check if this is a response
+        if message.message_type() != MessageType::Response {
+            return Ok(None);
+        }
+
+        // Try to extract from TXT record in answers
+        for answer in message.answers() {
+            if answer.record_type() == RecordType::TXT {
+                let name = answer.name().to_ascii();
+                let name_str = name.trim_end_matches('.');
+                
+                // Check if name matches any of our expected domains
+                let domain_match = expected_domains.iter().any(|domain| {
+                    (name_str.ends_with(&format!(".{}", domain)) || name_str == domain.as_str())
+                        && name_str.len() > domain.len()
+                });
+
+                if domain_match {
+                    // Extract subdomain
+                    let domain = expected_domains.iter()
+                        .filter(|d| {
+                            let domain_with_dot = format!(".{}", d);
+                            name_str.ends_with(&domain_with_dot) || name_str == d.as_str()
+                        })
+                        .max_by_key(|d| d.len())
+                        .ok_or_else(|| anyhow!("Domain not found"))?;
+                    
+                    let subdomain_part = if name_str == domain.as_str() {
+                        return Err(anyhow!("Response has no subdomain"));
+                    } else {
+                        if let Some(stripped) = name_str.strip_suffix(&format!(".{}", domain)) {
+                            stripped
+                        } else if name_str.ends_with(domain) {
+                            &name_str[..name_str.len() - domain.len()].trim_start_matches('.')
+                        } else {
+                            return Err(anyhow!("Invalid response format"));
+                        }
+                    };
+                    
+                    // Decode the subdomain
+                    return self.decode_subdomain(subdomain_part);
+                }
+            }
+        }
+
+        // If no TXT record found, try to extract from the query name (some DNS servers echo it)
+        if !message.queries().is_empty() {
+            // Use the same logic as decode_from_dns_query
+            return self.decode_from_dns_query(message, expected_domains);
+        }
+
+        Ok(None)
     }
 
     pub fn max_payload_per_query(&self) -> usize {

@@ -1,5 +1,6 @@
 {
   "local_udp": "127.0.0.1:5355",
+  "response_mode": "udp",
   "domains": [
     "example.com",
     "tunnel.example.com"
@@ -7,7 +8,8 @@
   "resolvers": [
     "127.0.0.1:53533"
   ],
-  "max_subdomain_length": 64,
+  "max_subdomain_length": 63,
+  "min_subdomain_length": 0,
   "rotate_resolvers": true,
   "randomize_local_port": false
 }
