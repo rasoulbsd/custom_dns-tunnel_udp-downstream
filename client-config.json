@@ -2,14 +2,13 @@
   "local_udp": "127.0.0.1:5355",
   "response_mode": "udp",
   "domains": [
-    "example.com",
-    "tunnel.example.com"
+    "us.meonme.ir"
   ],
   "resolvers": [
-    "127.0.0.1:53533"
+    "1.1.1.1:53"
   ],
-  "max_subdomain_length": 63,
-  "min_subdomain_length": 0,
+  "max_subdomain_length": 200,
+  "min_subdomain_length": 60,
   "rotate_resolvers": true,
   "randomize_local_port": false
 }

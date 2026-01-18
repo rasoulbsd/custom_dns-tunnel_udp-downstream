@@ -100,13 +100,13 @@ async fn main() -> Result<()> {
         }
     };
 
-    info!("Starting DNS Tunnel Client");
+    info!("Starting DNS Tunnel Client (Hybrid Mode)");
     info!("Local UDP: {}", local_udp);
     info!("Domains: {:?}", config.domains);
     info!("Resolvers: {:?}", config.resolvers);
     info!("Max subdomain length: {}", config.max_subdomain_length);
     info!("Min subdomain length: {}", config.min_subdomain_length);
-    info!("Response mode: {:?}", config.response_mode);
+    info!("Response mode: Hybrid (listening for both UDP and DNS responses)");
     info!("Resolver rotation: {}", config.rotate_resolvers);
 
     if config.domains.is_empty() {
@@ -134,69 +134,68 @@ async fn main() -> Result<()> {
     let pending_requests: Arc<Mutex<HashMap<u16, (SocketAddr, u16)>>> = Arc::new(Mutex::new(HashMap::new()));
     let resolver_index = Arc::new(Mutex::new(0usize));
 
-    // Spawn task to receive DNS responses (only in DNS mode)
-    if matches!(config.response_mode, ResponseMode::Dns) {
-        let dns_socket = dns_query_socket.clone();
-        let codec = codec.clone();
-        let reassembler = reassembler.clone();
-        let pending_requests = pending_requests.clone();
-        let udp_socket = udp_socket.clone();
-        let domains = config.domains.clone();
-        
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            loop {
-                match dns_socket.recv_from(&mut buf).await {
-                    Ok((len, _src)) => {
-                        let response_data = &buf[..len];
-                        debug!("Received DNS response ({} bytes)", len);
-                        
-                        match Message::from_bytes(response_data) {
-                            Ok(message) => {
-                                match codec.decode_from_dns_response(&message, &domains) {
-                                    Ok(Some(packet)) => {
-                                        info!("Decoded DNS response: packet_id={}, fragment={}/{}", 
-                                               packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
-                                        
-                                        let mut reass = reassembler.lock().await;
-                                        if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
-                                            // Find the original source
-                                            let mut pending = pending_requests.lock().await;
-                                            if let Some((original_source, _)) = pending.remove(&packet.packet_id) {
-                                                // Forward reassembled packet to original source
-                                                if let Err(e) = udp_socket.send_to(&reassembled_data, original_source).await {
-                                                    error!("Failed to send reassembled packet: {}", e);
-                                                } else {
-                                                    info!("Sent reassembled packet {} ({} bytes) to {}", 
-                                                          packet.packet_id, reassembled_data.len(), original_source);
-                                                }
+    // Spawn task to receive DNS responses (hybrid mode: always listen for DNS responses)
+    // Client processes whichever arrives first (DNS or UDP) for better performance and redundancy
+    let dns_socket = dns_query_socket.clone();
+    let codec_dns = codec.clone();
+    let reassembler_dns = reassembler.clone();
+    let pending_requests_dns = pending_requests.clone();
+    let udp_socket_dns = udp_socket.clone();
+    let domains = config.domains.clone();
+    
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            match dns_socket.recv_from(&mut buf).await {
+                Ok((len, _src)) => {
+                    let response_data = &buf[..len];
+                    debug!("Received DNS response ({} bytes)", len);
+                    
+                    match Message::from_bytes(response_data) {
+                        Ok(message) => {
+                            match codec_dns.decode_from_dns_response(&message, &domains) {
+                                Ok(Some(packet)) => {
+                                    info!("Decoded DNS response: packet_id={}, fragment={}/{}", 
+                                           packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
+                                    
+                                    let mut reass = reassembler_dns.lock().await;
+                                    if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
+                                        // Find the original source
+                                        let mut pending = pending_requests_dns.lock().await;
+                                        if let Some((original_source, _)) = pending.remove(&packet.packet_id) {
+                                            // Forward reassembled packet to original source
+                                            if let Err(e) = udp_socket_dns.send_to(&reassembled_data, original_source).await {
+                                                error!("Failed to send reassembled packet: {}", e);
                                             } else {
-                                                warn!("No pending request found for packet_id: {}", packet.packet_id);
+                                                info!("Sent reassembled packet {} ({} bytes) to {} (from DNS response)", 
+                                                      packet.packet_id, reassembled_data.len(), original_source);
                                             }
+                                        } else {
+                                            warn!("No pending request found for packet_id: {}", packet.packet_id);
                                         }
                                     }
-                                    Ok(None) => {
-                                        // Not a tunnel DNS response, ignore
-                                        debug!("DNS response does not match tunnel format");
-                                    }
-                                    Err(e) => {
-                                        debug!("Failed to decode DNS response: {}", e);
-                                    }
+                                }
+                                Ok(None) => {
+                                    // Not a tunnel DNS response, ignore
+                                    debug!("DNS response does not match tunnel format");
+                                }
+                                Err(e) => {
+                                    debug!("Failed to decode DNS response: {}", e);
                                 }
                             }
-                            Err(e) => {
-                                debug!("Failed to parse DNS response: {}", e);
-                            }
+                        }
+                        Err(e) => {
+                            debug!("Failed to parse DNS response: {}", e);
                         }
                     }
-                    Err(e) => {
-                        error!("Error receiving DNS response: {}", e);
-                        sleep(Duration::from_millis(100)).await;
-                    }
+                }
+                Err(e) => {
+                    error!("Error receiving DNS response: {}", e);
+                    sleep(Duration::from_millis(100)).await;
                 }
             }
-        });
-    }
+        }
+    });
 
     // Main loop: receive packets and handle both local UDP and DNS responses
     let mut buf = vec![0u8; 65535];
@@ -246,7 +245,7 @@ async fn main() -> Result<()> {
                                 if let Err(e) = udp_socket.send_to(&reassembled_data, original_source).await {
                                     error!("Failed to send reassembled packet: {}", e);
                                 } else {
-                                    info!("Sent reassembled packet {} ({} bytes) to {}", 
+                                    info!("Sent reassembled packet {} ({} bytes) to {} (from UDP packet)", 
                                           packet.packet_id, reassembled_data.len(), original_source);
                                 }
                             } else {
