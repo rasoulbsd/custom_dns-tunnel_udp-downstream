@@ -323,11 +323,11 @@ async fn main() -> Result<()> {
                         if has_pending {
                             // Valid response - process it
                             info!("[UDP-RESPONSE] Received: packet_id={}, fragment={}/{}", 
-                                   packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
-                            let mut reass = reassembler.lock().await;
-                            if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
-                                // Find the original source
-                                if let Some((original_source, _)) = pending.remove(&packet.packet_id) {
+                               packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
+                        let mut reass = reassembler.lock().await;
+                        if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
+                            // Find the original source
+                            if let Some((original_source, _)) = pending.remove(&packet.packet_id) {
                                     // Mark as processed BEFORE sending
                                     {
                                         let mut processed = processed_response_ids.lock().await;
@@ -339,10 +339,10 @@ async fn main() -> Result<()> {
                                         // #endregion
                                         if processed.len() > 1000 { processed.clear(); }
                                     }
-                                    // Forward reassembled packet to original source
+                                // Forward reassembled packet to original source
                                     drop(pending); // Release lock before async operation
-                                    if let Err(e) = udp_socket.send_to(&reassembled_data, original_source).await {
-                                        error!("Failed to send reassembled packet: {}", e);
+                                if let Err(e) = udp_socket.send_to(&reassembled_data, original_source).await {
+                                    error!("Failed to send reassembled packet: {}", e);
                                     } else {
                                         info!("[UDP-RESPONSE] Sent reassembled packet {} ({} bytes) to {}", 
                                               packet.packet_id, reassembled_data.len(), original_source);

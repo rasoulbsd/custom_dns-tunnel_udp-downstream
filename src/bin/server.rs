@@ -123,7 +123,12 @@ async fn main() -> Result<()> {
 
     let codec = Arc::new(DnsCodec::new_with_min(config.max_subdomain_length, config.min_subdomain_length));
     let reassembler = Arc::new(Mutex::new(PacketReassembler::new()));
-    // Map: packet_id -> (dns_source, query_id, domain)
+    // Map: packet_id -> (reply_addr, query_id, domain)
+    //
+    // - For DNS uplink, reply_addr is the resolver/client socket that sent the DNS query (IP:port).
+    //   When using public resolvers (1.1.1.1/8.8.8.8), this will be the resolver's source port, and we MUST reply there.
+    // - For UDP uplink, reply_addr is currently the client's configured UDP response address (IP:client_udp_port),
+    //   and query_id is 0 (no DNS query id).
     let pending_requests: Arc<Mutex<HashMap<u16, (SocketAddr, u16, String)>>> = Arc::new(Mutex::new(HashMap::new()));
     // Queue for matching responses from target_udp to packet_id
     // For echo servers: we can use hash-based matching (exact data match)
@@ -380,11 +385,11 @@ async fn main() -> Result<()> {
                                 info!("UDP socket available: {}, DNS socket available: {}", 
                                       client_response_socket.is_some(), dns_socket_for_response.is_some());
                                 
-                                // Get query_id and domain from pending_requests
-                                let (query_id, domain) = {
+                                // Get reply_addr, query_id and domain from pending_requests
+                                let (reply_addr, query_id, domain) = {
                                     let pending = pending_requests_for_response.lock().await;
-                                    if let Some((_, qid, dom)) = pending.get(&original_packet_id) {
-                                        (*qid, dom.clone())
+                                    if let Some((reply, qid, dom)) = pending.get(&original_packet_id) {
+                                        (*reply, *qid, dom.clone())
                                     } else {
                                         warn!("No pending request found for packet_id: {}", original_packet_id);
                                         continue;
@@ -408,14 +413,14 @@ async fn main() -> Result<()> {
                                         
                                         if let Some(ref sock) = client_response_socket {
                                             info!("[UDP-RESPONSE] Sending {} fragments to {}", total_fragments, client_udp_addr);
-                                            for (fragment_id, fragment_data) in fragments.iter().enumerate() {
-                                                let udp_packet = codec.encode_udp_packet(
-                                                    fragment_data,
-                                                    response_packet_id,
-                                                    fragment_id as u8,
-                                                    total_fragments,
-                                                );
-                                                
+                                for (fragment_id, fragment_data) in fragments.iter().enumerate() {
+                                    let udp_packet = codec.encode_udp_packet(
+                                        fragment_data,
+                                        response_packet_id,
+                                        fragment_id as u8,
+                                        total_fragments,
+                                    );
+                                    
                                                 if let Err(e) = sock.send_to(&udp_packet, client_udp_addr).await {
                                                     warn!("Failed to send UDP response to {}: {}", client_udp_addr, e);
                                                 } else {
@@ -438,6 +443,12 @@ async fn main() -> Result<()> {
                                         info!("[DNS-RESPONSE] Fragmenting into {} fragments", total_fragments);
                                         
                                         if let Some(ref sock) = dns_socket_for_response {
+                                            // DNS replies only make sense if we have a real DNS query_id.
+                                            // For UDP uplink we store query_id=0, so skip sending DNS responses.
+                                            if query_id == 0 {
+                                                warn!("[DNS-RESPONSE] Skipping DNS response for packet_id {}: query_id=0 (not a DNS uplink)", response_packet_id);
+                                                continue;
+                                            }
                                             // Send for each domain (spam mode)
                                             for spam_domain in &domains_for_response {
                                                 for (fragment_id, fragment_data) in fragments.iter().enumerate() {
@@ -458,11 +469,13 @@ async fn main() -> Result<()> {
                                                             }
                                                             let response_bytes = encoder.into_bytes();
                                                             
-                                                            if let Err(e) = sock.send_to(&response_bytes, client_udp_addr).await {
-                                                                warn!("Failed to send DNS response: {}", e);
+                                                            // IMPORTANT: reply to the DNS query source (resolver/client IP:port),
+                                                            // not to client_udp_port. This is required for public resolvers to work.
+                                                            if let Err(e) = sock.send_to(&response_bytes, reply_addr).await {
+                                                                warn!("Failed to send DNS response to {}: {}", reply_addr, e);
                                                             } else {
                                                                 info!("[DNS-RESPONSE] Sent fragment {}/{} ({} bytes) to {} (domain: {})", 
-                                                                       fragment_id + 1, total_fragments, response_bytes.len(), client_udp_addr, spam_domain);
+                                                                       fragment_id + 1, total_fragments, response_bytes.len(), reply_addr, spam_domain);
                                                             }
                                                         }
                                                         Err(e) => {
@@ -496,8 +509,8 @@ async fn main() -> Result<()> {
                                                 );
                                                 
                                                 if let Err(e) = sock.send_to(&udp_packet, client_udp_addr).await {
-                                                    warn!("Failed to send UDP response: {}", e);
-                                                } else {
+                                        warn!("Failed to send UDP response: {}", e);
+                                    } else {
                                                     debug!("Sent UDP response fragment {}/{} ({} bytes) to {}", 
                                                            fragment_id + 1, total_fragments_udp, udp_packet.len(), client_udp_addr);
                                                 }
@@ -507,10 +520,15 @@ async fn main() -> Result<()> {
                                         // Send DNS responses (backup path - more reliable)
                                         // SPAM MODE: Send DNS responses for ALL domains in the config
                                         if let Some(ref sock) = dns_socket_for_response {
+                                            // DNS replies only make sense if we have a real DNS query_id.
+                                            // For UDP uplink we store query_id=0, so skip sending DNS responses.
+                                            if query_id == 0 {
+                                                debug!("[HYBRID-RESPONSE] Skipping DNS response for packet_id {}: query_id=0 (not a DNS uplink)", response_packet_id);
+                                            } else {
                                             // #region agent log
                                             use std::io::Write as _;
                                             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/.cursor/debug.log") {
-                                                let _ = writeln!(f, r#"{{"hypothesisId":"E","location":"server.rs:486","message":"dns_response_sending","data":{{"dest":"{}","fragments":{},"domains_count":{}}},"timestamp":{}}}"#, client_udp_addr, total_fragments_dns, domains_for_response.len(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+                                                let _ = writeln!(f, r#"{{"hypothesisId":"E","location":"server.rs:486","message":"dns_response_sending","data":{{"dest":"{}","fragments":{},"domains_count":{}}},"timestamp":{}}}"#, reply_addr, total_fragments_dns, domains_for_response.len(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
                                             }
                                             // #endregion
                                             // Send response for EACH domain (spam mode)
@@ -533,11 +551,13 @@ async fn main() -> Result<()> {
                                                             }
                                                             let response_bytes = encoder.into_bytes();
                                                             
-                                                            if let Err(e) = sock.send_to(&response_bytes, client_udp_addr).await {
-                                                                warn!("Failed to send DNS response: {}", e);
+                                                            // IMPORTANT: reply to the DNS query source (resolver/client IP:port),
+                                                            // not to client_udp_port. This is required for public resolvers to work.
+                                                            if let Err(e) = sock.send_to(&response_bytes, reply_addr).await {
+                                                                warn!("Failed to send DNS response to {}: {}", reply_addr, e);
                                                             } else {
                                                                 debug!("[DNS-RESPONSE] Sent fragment {}/{} ({} bytes) to {} (domain: {})", 
-                                                                       fragment_id + 1, total_fragments_dns, response_bytes.len(), client_udp_addr, spam_domain);
+                                                                       fragment_id + 1, total_fragments_dns, response_bytes.len(), reply_addr, spam_domain);
                                                             }
                                                         }
                                                         Err(e) => {
@@ -545,6 +565,7 @@ async fn main() -> Result<()> {
                                                         }
                                                     }
                                                 }
+                                            }
                                             }
                                         }
                                         
