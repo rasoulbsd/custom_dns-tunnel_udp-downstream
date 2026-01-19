@@ -212,7 +212,7 @@ async fn main() -> Result<()> {
                                             if let Some((original_source, _)) = pending.remove(&packet.packet_id) {
                                                 // Mark as processed
                                                 {
-                                                    let processed = processed_response_ids_dns.lock().await;
+                                                    let mut processed = processed_response_ids_dns.lock().await;
                                                     processed.insert(packet.packet_id);
                                                     if processed.len() > 1000 { processed.clear(); }
                                                 }
