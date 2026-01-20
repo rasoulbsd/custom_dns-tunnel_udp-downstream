@@ -6,6 +6,7 @@ use dns_tunnel::{
     packet::{fragment_packet, PacketReassembler},
     utils::get_random_port,
 };
+use futures::future::join_all;
 use hickory_proto::{
     op::{Message, ResponseCode},
     serialize::binary::{BinDecodable, BinEncodable, BinEncoder},
@@ -406,53 +407,77 @@ async fn main() -> Result<()> {
                                 info!("[DEBUG] About to match response_mode: {:?}", response_mode);
                                 match response_mode {
                                     ResponseMode::Udp => {
-                                        // UDP only mode
-                                        info!("[UDP-RESPONSE] Mode: UDP only, client_response_socket is_some: {}", client_response_socket.is_some());
+                                        // UDP only mode - PARALLEL SENDING
+                                        info!("[UDP-RESPONSE] Mode: UDP only (parallel), client_response_socket is_some: {}", client_response_socket.is_some());
                                         let max_chunk = 65507 - 4; // Max UDP size minus header
                                         let fragments = fragment_packet(data, max_chunk);
                                         let total_fragments = fragments.len() as u8;
                                         
-                                        info!("[UDP-RESPONSE] Fragmenting into {} fragments", total_fragments);
+                                        info!("[UDP-RESPONSE] Fragmenting into {} fragments (parallel send)", total_fragments);
                                         
                                         if let Some(ref sock) = client_response_socket {
-                                            info!("[UDP-RESPONSE] Sending {} fragments to {}", total_fragments, client_udp_addr);
-                                for (fragment_id, fragment_data) in fragments.iter().enumerate() {
-                                    let udp_packet = codec.encode_udp_packet(
-                                        fragment_data,
-                                        response_packet_id,
-                                        fragment_id as u8,
-                                        total_fragments,
-                                    );
-                                    
-                                                if let Err(e) = sock.send_to(&udp_packet, client_udp_addr).await {
-                                                    warn!("Failed to send UDP response to {}: {}", client_udp_addr, e);
-                                                } else {
-                                                    let server_addr = sock.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-                                                    info!("[UDP-RESPONSE] Sent fragment {}/{} ({} bytes) from {} to {}", 
-                                                           fragment_id + 1, total_fragments, udp_packet.len(), server_addr, client_udp_addr);
-                                                }
+                                            info!("[UDP-RESPONSE] Sending {} fragments to {} in parallel", total_fragments, client_udp_addr);
+                                            
+                                            // Prepare all UDP packets first
+                                            let mut udp_packets: Vec<(u8, Vec<u8>)> = Vec::new();
+                                            for (fragment_id, fragment_data) in fragments.iter().enumerate() {
+                                                let udp_packet = codec.encode_udp_packet(
+                                                    fragment_data,
+                                                    response_packet_id,
+                                                    fragment_id as u8,
+                                                    total_fragments,
+                                                );
+                                                udp_packets.push((fragment_id as u8, udp_packet));
                                             }
+                                            
+                                            // Send all fragments in parallel
+                                            let sock_clone = Arc::clone(sock);
+                                            let send_tasks: Vec<_> = udp_packets.into_iter().map(|(frag_id, packet)| {
+                                                let sock = Arc::clone(&sock_clone);
+                                                let addr = client_udp_addr;
+                                                let total = total_fragments;
+                                                tokio::spawn(async move {
+                                                    match sock.send_to(&packet, addr).await {
+                                                        Ok(_) => {
+                                                            debug!("[UDP-RESPONSE] Sent fragment {}/{} ({} bytes) to {}", 
+                                                                   frag_id + 1, total, packet.len(), addr);
+                                                            Ok(())
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("Failed to send UDP response fragment {} to {}: {}", frag_id + 1, addr, e);
+                                                            Err(e)
+                                                        }
+                                                    }
+                                                })
+                                            }).collect();
+                                            
+                                            let results = join_all(send_tasks).await;
+                                            let success = results.iter().filter(|r| r.is_ok() && r.as_ref().unwrap().is_ok()).count();
+                                            info!("[UDP-RESPONSE] Sent {}/{} fragments successfully", success, total_fragments);
                                         } else {
                                             warn!("[UDP-RESPONSE] client_response_socket is None! Cannot send UDP response.");
                                         }
                                     }
                                     ResponseMode::Dns => {
-                                        // DNS only mode - SPAM MODE: send for ALL domains
-                                        info!("[DNS-RESPONSE] Mode: DNS only (spam: {} domains)", domains_for_response.len());
+                                        // DNS only mode - SPAM MODE: send for ALL domains in PARALLEL
+                                        info!("[DNS-RESPONSE] Mode: DNS only (parallel spam: {} domains)", domains_for_response.len());
                                         let max_chunk = codec.max_payload_per_query();
                                         let fragments = fragment_packet(data, max_chunk);
                                         let total_fragments = fragments.len() as u8;
                                         
-                                        info!("[DNS-RESPONSE] Fragmenting into {} fragments", total_fragments);
+                                        info!("[DNS-RESPONSE] Fragmenting into {} fragments x {} domains = {} total sends", 
+                                              total_fragments, domains_for_response.len(), 
+                                              total_fragments as usize * domains_for_response.len());
                                         
                                         if let Some(ref sock) = dns_socket_for_response {
                                             // DNS replies only make sense if we have a real DNS query_id.
-                                            // For UDP uplink we store query_id=0, so skip sending DNS responses.
                                             if query_id == 0 {
                                                 warn!("[DNS-RESPONSE] Skipping DNS response for packet_id {}: query_id=0 (not a DNS uplink)", response_packet_id);
                                                 continue;
                                             }
-                                            // Send for each domain (spam mode)
+                                            
+                                            // Pre-encode all DNS responses for all domains and fragments
+                                            let mut dns_packets: Vec<(String, u8, Vec<u8>)> = Vec::new();
                                             for spam_domain in &domains_for_response {
                                                 for (fragment_id, fragment_data) in fragments.iter().enumerate() {
                                                     match codec.encode_to_dns_response(
@@ -470,18 +495,7 @@ async fn main() -> Result<()> {
                                                                 warn!("Failed to encode DNS response: {}", e);
                                                                 continue;
                                                             }
-                                                            let response_bytes = encoder.into_bytes();
-                                                            
-                                                            // IMPORTANT: reply to the DNS query source (resolver/client IP:port),
-                                                            // not to client_udp_port. This is required for public resolvers to work.
-                                                            let local_addr = sock.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-                                                            debug!("[DNS-RESPONSE] About to send to reply_addr={} from {} (packet_id={}, fragment={}/{})", reply_addr, local_addr, response_packet_id, fragment_id + 1, total_fragments);
-                                                            if let Err(e) = sock.send_to(&response_bytes, reply_addr).await {
-                                                                warn!("[DNS-RESPONSE] Failed to send to {} from {}: {}", reply_addr, local_addr, e);
-                                                            } else {
-                                                                info!("[DNS-RESPONSE] Sent fragment {}/{} ({} bytes) from {} to {} (domain: {})", 
-                                                                       fragment_id + 1, total_fragments, response_bytes.len(), local_addr, reply_addr, spam_domain);
-                                                            }
+                                                            dns_packets.push((spam_domain.clone(), fragment_id as u8, encoder.into_bytes().to_vec()));
                                                         }
                                                         Err(e) => {
                                                             warn!("Failed to encode DNS response: {}", e);
@@ -489,10 +503,36 @@ async fn main() -> Result<()> {
                                                     }
                                                 }
                                             }
+                                            
+                                            // Send all DNS responses in parallel
+                                            let sock_clone = Arc::clone(sock);
+                                            let total = total_fragments;
+                                            let send_tasks: Vec<_> = dns_packets.into_iter().map(|(domain, frag_id, packet)| {
+                                                let sock = Arc::clone(&sock_clone);
+                                                let addr = reply_addr;
+                                                tokio::spawn(async move {
+                                                    match sock.send_to(&packet, addr).await {
+                                                        Ok(_) => {
+                                                            debug!("[DNS-RESPONSE] Sent fragment {}/{} ({} bytes) to {} (domain: {})", 
+                                                                   frag_id + 1, total, packet.len(), addr, domain);
+                                                            Ok(())
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("[DNS-RESPONSE] Failed to send fragment {} to {}: {}", frag_id + 1, addr, e);
+                                                            Err(e)
+                                                        }
+                                                    }
+                                                })
+                                            }).collect();
+                                            
+                                            let results = join_all(send_tasks).await;
+                                            let success = results.iter().filter(|r| r.is_ok() && r.as_ref().unwrap().is_ok()).count();
+                                            info!("[DNS-RESPONSE] Sent {}/{} packets successfully (parallel spam)", 
+                                                  success, total_fragments as usize * domains_for_response.len());
                                         }
                                     }
                                     ResponseMode::Hybrid | ResponseMode::HybridAlias => {
-                                        // Hybrid mode: send both UDP and DNS
+                                        // Hybrid mode: send both UDP and DNS in PARALLEL
                                         let max_chunk_udp = 65507 - 4; // Max UDP size minus header
                                         let fragments_udp = fragment_packet(data, max_chunk_udp);
                                         let total_fragments_udp = fragments_udp.len() as u8;
@@ -501,10 +541,17 @@ async fn main() -> Result<()> {
                                         let fragments_dns = fragment_packet(data, max_chunk_dns);
                                         let total_fragments_dns = fragments_dns.len() as u8;
                                         
-                                        info!("[HYBRID-RESPONSE] Fragmenting: {} UDP + {} DNS fragments", total_fragments_udp, total_fragments_dns);
+                                        let total_sends = total_fragments_udp as usize + 
+                                            (if query_id != 0 { total_fragments_dns as usize * domains_for_response.len() } else { 0 });
+                                        info!("[HYBRID-RESPONSE] Parallel send: {} UDP + {} DNS x {} domains = {} total", 
+                                              total_fragments_udp, total_fragments_dns, domains_for_response.len(), total_sends);
                                         
-                                        // Send UDP packets (primary path - faster)
+                                        // Collect all send tasks for parallel execution
+                                        let mut all_tasks: Vec<tokio::task::JoinHandle<Result<(), std::io::Error>>> = Vec::new();
+                                        
+                                        // Prepare and spawn UDP send tasks
                                         if let Some(ref sock) = client_response_socket {
+                                            let sock_clone = Arc::clone(sock);
                                             for (fragment_id, fragment_data) in fragments_udp.iter().enumerate() {
                                                 let udp_packet = codec.encode_udp_packet(
                                                     fragment_data,
@@ -513,70 +560,82 @@ async fn main() -> Result<()> {
                                                     total_fragments_udp,
                                                 );
                                                 
-                                                if let Err(e) = sock.send_to(&udp_packet, client_udp_addr).await {
-                                        warn!("Failed to send UDP response: {}", e);
-                                    } else {
-                                                    debug!("Sent UDP response fragment {}/{} ({} bytes) to {}", 
-                                                           fragment_id + 1, total_fragments_udp, udp_packet.len(), client_udp_addr);
-                                                }
+                                                let sock = Arc::clone(&sock_clone);
+                                                let addr = client_udp_addr;
+                                                let total = total_fragments_udp;
+                                                let frag_id = fragment_id as u8;
+                                                all_tasks.push(tokio::spawn(async move {
+                                                    match sock.send_to(&udp_packet, addr).await {
+                                                        Ok(_) => {
+                                                            debug!("[HYBRID-UDP] Sent fragment {}/{} to {}", frag_id + 1, total, addr);
+                                                            Ok(())
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("[HYBRID-UDP] Failed to send fragment {} to {}: {}", frag_id + 1, addr, e);
+                                                            Err(e)
+                                                        }
+                                                    }
+                                                }));
                                             }
                                         }
                                         
-                                        // Send DNS responses (backup path - more reliable)
-                                        // SPAM MODE: Send DNS responses for ALL domains in the config
+                                        // Prepare and spawn DNS send tasks (spam mode - all domains in parallel)
                                         if let Some(ref sock) = dns_socket_for_response {
-                                            // DNS replies only make sense if we have a real DNS query_id.
-                                            // For UDP uplink we store query_id=0, so skip sending DNS responses.
-                                            if query_id == 0 {
-                                                debug!("[HYBRID-RESPONSE] Skipping DNS response for packet_id {}: query_id=0 (not a DNS uplink)", response_packet_id);
-                                            } else {
-                                            // #region agent log
-                                            use std::io::Write as _;
-                                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/.cursor/debug.log") {
-                                                let _ = writeln!(f, r#"{{"hypothesisId":"E","location":"server.rs:486","message":"dns_response_sending","data":{{"dest":"{}","fragments":{},"domains_count":{}}},"timestamp":{}}}"#, reply_addr, total_fragments_dns, domains_for_response.len(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-                                            }
-                                            // #endregion
-                                            // Send response for EACH domain (spam mode)
-                                            for spam_domain in &domains_for_response {
-                                                for (fragment_id, fragment_data) in fragments_dns.iter().enumerate() {
-                                                    match codec.encode_to_dns_response(
-                                                        fragment_data,
-                                                        spam_domain,
-                                                        response_packet_id,
-                                                        fragment_id as u8,
-                                                        total_fragments_dns,
-                                                        query_id,
-                                                    ) {
-                                                        Ok(dns_response) => {
-                                                            let mut buf = Vec::new();
-                                                            let mut encoder = BinEncoder::new(&mut buf);
-                                                            if let Err(e) = dns_response.emit(&mut encoder) {
+                                            if query_id != 0 {
+                                                let sock_clone = Arc::clone(sock);
+                                                for spam_domain in &domains_for_response {
+                                                    for (fragment_id, fragment_data) in fragments_dns.iter().enumerate() {
+                                                        match codec.encode_to_dns_response(
+                                                            fragment_data,
+                                                            spam_domain,
+                                                            response_packet_id,
+                                                            fragment_id as u8,
+                                                            total_fragments_dns,
+                                                            query_id,
+                                                        ) {
+                                                            Ok(dns_response) => {
+                                                                let mut buf = Vec::new();
+                                                                let mut encoder = BinEncoder::new(&mut buf);
+                                                                if let Err(e) = dns_response.emit(&mut encoder) {
+                                                                    warn!("Failed to encode DNS response: {}", e);
+                                                                    continue;
+                                                                }
+                                                                let response_bytes = encoder.into_bytes().to_vec();
+                                                                
+                                                                let sock = Arc::clone(&sock_clone);
+                                                                let addr = reply_addr;
+                                                                let total = total_fragments_dns;
+                                                                let frag_id = fragment_id as u8;
+                                                                let domain = spam_domain.clone();
+                                                                all_tasks.push(tokio::spawn(async move {
+                                                                    match sock.send_to(&response_bytes, addr).await {
+                                                                        Ok(_) => {
+                                                                            debug!("[HYBRID-DNS] Sent fragment {}/{} to {} (domain: {})", 
+                                                                                   frag_id + 1, total, addr, domain);
+                                                                            Ok(())
+                                                                        }
+                                                                        Err(e) => {
+                                                                            warn!("[HYBRID-DNS] Failed to send fragment {} to {}: {}", frag_id + 1, addr, e);
+                                                                            Err(e)
+                                                                        }
+                                                                    }
+                                                                }));
+                                                            }
+                                                            Err(e) => {
                                                                 warn!("Failed to encode DNS response: {}", e);
-                                                                continue;
                                                             }
-                                                            let response_bytes = encoder.into_bytes();
-                                                            
-                                                            // IMPORTANT: reply to the DNS query source (resolver/client IP:port),
-                                                            // not to client_udp_port. This is required for public resolvers to work.
-                                                            let local_addr = sock.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-                                                            if let Err(e) = sock.send_to(&response_bytes, reply_addr).await {
-                                                                warn!("[DNS-RESPONSE] Failed to send to {} from {}: {}", reply_addr, local_addr, e);
-                                                            } else {
-                                                                debug!("[DNS-RESPONSE] Sent fragment {}/{} ({} bytes) from {} to {} (domain: {})", 
-                                                                       fragment_id + 1, total_fragments_dns, response_bytes.len(), local_addr, reply_addr, spam_domain);
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            warn!("Failed to encode DNS response: {}", e);
                                                         }
                                                     }
                                                 }
-                                            }
+                                            } else {
+                                                debug!("[HYBRID-RESPONSE] Skipping DNS for packet_id {}: query_id=0", response_packet_id);
                                             }
                                         }
                                         
-                                        info!("[HYBRID-RESPONSE] Sent packet_id {}: {} UDP + {} DNS fragments", 
-                                              response_packet_id, total_fragments_udp, total_fragments_dns);
+                                        // Wait for all sends to complete in parallel
+                                        let results = join_all(all_tasks).await;
+                                        let success = results.iter().filter(|r| r.is_ok() && r.as_ref().unwrap().is_ok()).count();
+                                        info!("[HYBRID-RESPONSE] Sent {}/{} packets successfully (parallel)", success, total_sends);
                                     }
                                 }
                             } else {

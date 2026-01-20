@@ -6,6 +6,7 @@ use dns_tunnel::{
     packet::{fragment_packet, PacketReassembler},
     utils::{get_random_port, rotate_resolver},
 };
+use futures::future::join_all;
 use hickory_proto::{
     op::Message,
     serialize::binary::{BinDecodable, BinEncodable, BinEncoder},
@@ -594,56 +595,85 @@ async fn main() -> Result<()> {
                             }
                         }
                         ResponseMode::Dns => {
-                            // DNS uplink: send as DNS queries
+                            // DNS uplink: send as DNS queries - PARALLEL to all resolvers
                             let max_chunk = codec.max_payload_per_query();
                             let fragments = fragment_packet(data, max_chunk);
                             let total_fragments = fragments.len() as u8;
+                            let num_resolvers = config.resolvers.len();
                             
-                            info!("[DNS-UPLINK] Fragmenting packet {} into {} fragments", packet_id, total_fragments);
+                            info!("[DNS-UPLINK] Fragmenting packet {} into {} fragments x {} resolvers = {} sends (parallel)", 
+                                  packet_id, total_fragments, num_resolvers, total_fragments as usize * num_resolvers);
                             
-                    for (fragment_id, fragment_data) in fragments.iter().enumerate() {
-                        match codec.encode_to_dns_query(
-                            fragment_data,
-                            domain,
-                            packet_id,
-                            fragment_id as u8,
-                            total_fragments,
-                        ) {
-                            Ok(dns_query) => {
-                                let mut buf = Vec::new();
-                                let mut encoder = BinEncoder::new(&mut buf);
-                                if let Err(e) = dns_query.emit(&mut encoder) {
-                                    error!("Failed to encode DNS query: {}", e);
-                                    continue;
-                                }
-
-                                    let query_bytes = encoder.into_bytes();
-                                    
-                                        // Send to all resolvers (spam)
-                                    for resolver in &config.resolvers {
-                                            if let Err(e) = dns_query_socket.send_to(&query_bytes, resolver).await {
-                                                warn!("[DNS-UPLINK] Failed to send to {}: {}", resolver, e);
-                                        } else {
-                                                info!("[DNS-UPLINK] Sent fragment {}/{} ({} bytes) to {}", 
-                                                   fragment_id + 1, total_fragments, query_bytes.len(), resolver);
+                            // Pre-encode all DNS queries
+                            let mut dns_packets: Vec<(u8, SocketAddr, Vec<u8>)> = Vec::new();
+                            for (fragment_id, fragment_data) in fragments.iter().enumerate() {
+                                match codec.encode_to_dns_query(
+                                    fragment_data,
+                                    domain,
+                                    packet_id,
+                                    fragment_id as u8,
+                                    total_fragments,
+                                ) {
+                                    Ok(dns_query) => {
+                                        let mut buf = Vec::new();
+                                        let mut encoder = BinEncoder::new(&mut buf);
+                                        if let Err(e) = dns_query.emit(&mut encoder) {
+                                            error!("Failed to encode DNS query: {}", e);
+                                            continue;
+                                        }
+                                        let query_bytes = encoder.into_bytes().to_vec();
+                                        
+                                        // Add task for each resolver (spam mode)
+                                        for resolver in &config.resolvers {
+                                            dns_packets.push((fragment_id as u8, *resolver, query_bytes.clone()));
                                         }
                                     }
-                            }
-                            Err(e) => {
-                                error!("Failed to encode packet to DNS: {}", e);
-                            }
+                                    Err(e) => {
+                                        error!("Failed to encode packet to DNS: {}", e);
+                                    }
                                 }
                             }
+                            
+                            // Send all fragments to all resolvers in parallel
+                            let sock = Arc::clone(&dns_query_socket);
+                            let send_tasks: Vec<_> = dns_packets.into_iter().map(|(frag_id, resolver, packet)| {
+                                let sock = Arc::clone(&sock);
+                                let total = total_fragments;
+                                tokio::spawn(async move {
+                                    match sock.send_to(&packet, resolver).await {
+                                        Ok(_) => {
+                                            debug!("[DNS-UPLINK] Sent fragment {}/{} ({} bytes) to {}", 
+                                                   frag_id + 1, total, packet.len(), resolver);
+                                            Ok(())
+                                        }
+                                        Err(e) => {
+                                            warn!("[DNS-UPLINK] Failed to send fragment {} to {}: {}", frag_id + 1, resolver, e);
+                                            Err(e)
+                                        }
+                                    }
+                                })
+                            }).collect();
+                            
+                            let results = join_all(send_tasks).await;
+                            let success = results.iter().filter(|r| r.is_ok() && r.as_ref().unwrap().is_ok()).count();
+                            info!("[DNS-UPLINK] Sent {}/{} packets successfully (parallel spam)", 
+                                  success, total_fragments as usize * num_resolvers);
                         }
                         ResponseMode::Hybrid | ResponseMode::HybridAlias => {
-                            // Hybrid uplink: send both UDP packets (to server_udp_addr) and DNS queries (to resolvers)
+                            // Hybrid uplink: send both UDP and DNS in PARALLEL
+                            let num_resolvers = config.resolvers.len();
+                            let mut all_tasks: Vec<tokio::task::JoinHandle<Result<(), std::io::Error>>> = Vec::new();
+                            let mut udp_count = 0usize;
+                            let mut dns_count = 0usize;
                             
-                            // UDP part (faster, may be blocked)
+                            // UDP part (faster, may be blocked) - prepare tasks
                             if let Some(server_udp) = config.server_udp_addr {
                                 let max_chunk_udp = 65507 - 4;
                                 let fragments_udp = fragment_packet(data, max_chunk_udp);
                                 let total_fragments_udp = fragments_udp.len() as u8;
+                                udp_count = fragments_udp.len();
                                 
+                                let sock = Arc::clone(&dns_query_socket);
                                 for (fragment_id, fragment_data) in fragments_udp.iter().enumerate() {
                                     let udp_packet = codec.encode_udp_packet(
                                         fragment_data,
@@ -652,26 +682,34 @@ async fn main() -> Result<()> {
                                         total_fragments_udp,
                                     );
                                     
-                                    if let Err(e) = dns_query_socket.send_to(&udp_packet, server_udp).await {
-                                        warn!("[HYBRID-UPLINK] UDP failed to {}: {}", server_udp, e);
-                                    } else {
-                                        debug!("[HYBRID-UPLINK] UDP fragment {}/{} to {}", 
-                                               fragment_id + 1, total_fragments_udp, server_udp);
-                                    }
+                                    let sock = Arc::clone(&sock);
+                                    let addr = server_udp;
+                                    let frag_id = fragment_id as u8;
+                                    let total = total_fragments_udp;
+                                    all_tasks.push(tokio::spawn(async move {
+                                        match sock.send_to(&udp_packet, addr).await {
+                                            Ok(_) => {
+                                                debug!("[HYBRID-UPLINK] UDP fragment {}/{} to {}", frag_id + 1, total, addr);
+                                                Ok(())
+                                            }
+                                            Err(e) => {
+                                                warn!("[HYBRID-UPLINK] UDP failed to {}: {}", addr, e);
+                                                Err(e)
+                                            }
+                                        }
+                                    }));
                                 }
-                                info!("[HYBRID-UPLINK] Sent {} UDP fragments to {}", total_fragments_udp, server_udp);
                             } else {
                                 warn!("[HYBRID-UPLINK] server_udp_addr not set, skipping UDP uplink");
                             }
                             
-                            // DNS part (more reliable, slower)
+                            // DNS part (more reliable, slower) - prepare tasks
                             let max_chunk_dns = codec.max_payload_per_query();
                             let fragments_dns = fragment_packet(data, max_chunk_dns);
                             let total_fragments_dns = fragments_dns.len() as u8;
+                            dns_count = fragments_dns.len() * num_resolvers;
                             
-                            info!("[HYBRID-UPLINK] Sending packet {} via DNS ({} fragments)", 
-                                  packet_id, total_fragments_dns);
-                            
+                            let sock = Arc::clone(&dns_query_socket);
                             for (fragment_id, fragment_data) in fragments_dns.iter().enumerate() {
                                 match codec.encode_to_dns_query(
                                     fragment_data,
@@ -687,16 +725,27 @@ async fn main() -> Result<()> {
                                             error!("Failed to encode DNS query: {}", e);
                                             continue;
                                         }
-
-                                        let query_bytes = encoder.into_bytes();
+                                        let query_bytes = encoder.into_bytes().to_vec();
                                         
+                                        // Spawn task for each resolver (spam mode)
                                         for resolver in &config.resolvers {
-                                            if let Err(e) = dns_query_socket.send_to(&query_bytes, resolver).await {
-                                                warn!("[HYBRID-UPLINK] DNS failed to {}: {}", resolver, e);
-                                            } else {
-                                                debug!("[HYBRID-UPLINK] DNS fragment {}/{} to {}", 
-                                                       fragment_id + 1, total_fragments_dns, resolver);
-                                            }
+                                            let sock = Arc::clone(&sock);
+                                            let addr = *resolver;
+                                            let frag_id = fragment_id as u8;
+                                            let total = total_fragments_dns;
+                                            let packet = query_bytes.clone();
+                                            all_tasks.push(tokio::spawn(async move {
+                                                match sock.send_to(&packet, addr).await {
+                                                    Ok(_) => {
+                                                        debug!("[HYBRID-UPLINK] DNS fragment {}/{} to {}", frag_id + 1, total, addr);
+                                                        Ok(())
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("[HYBRID-UPLINK] DNS failed to {}: {}", addr, e);
+                                                        Err(e)
+                                                    }
+                                                }
+                                            }));
                                         }
                                     }
                                     Err(e) => {
@@ -705,8 +754,12 @@ async fn main() -> Result<()> {
                                 }
                             }
                             
-                            info!("[HYBRID-UPLINK] Sent packet {} via DNS ({} fragments)", 
-                                  packet_id, total_fragments_dns);
+                            // Wait for all sends to complete in parallel
+                            let total_sends = udp_count + dns_count;
+                            info!("[HYBRID-UPLINK] Sending {} UDP + {} DNS = {} total (parallel)", udp_count, dns_count, total_sends);
+                            let results = join_all(all_tasks).await;
+                            let success = results.iter().filter(|r| r.is_ok() && r.as_ref().unwrap().is_ok()).count();
+                            info!("[HYBRID-UPLINK] Sent {}/{} packets successfully (parallel)", success, total_sends);
                         }
                     }
                 }
