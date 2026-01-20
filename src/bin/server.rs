@@ -721,12 +721,16 @@ async fn main() -> Result<()> {
                                 info!("[DNS-QUERY] Decoded from {}: packet_id={}, fragment={}/{}", 
                                        dns_source, packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
 
-                                // Extract domain from query for DNS responses
+                                // Extract domain from query for DNS responses (case-insensitive)
                                 let domain = if let Some(query) = message.queries().first() {
                                     let query_name = query.name().to_ascii().trim_end_matches('.').to_string();
-                                    // Find matching domain
+                                    let query_name_lower = query_name.to_lowercase();
+                                    // Find matching domain (case-insensitive)
                                     config.domains.iter()
-                                        .find(|d| query_name.ends_with(d.as_str()))
+                                        .find(|d| {
+                                            let d_lower = d.to_lowercase();
+                                            query_name_lower.ends_with(&d_lower) || query_name_lower == d_lower
+                                        })
                                         .cloned()
                                         .unwrap_or_else(|| config.domains[0].clone())
                                 } else {

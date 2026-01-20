@@ -197,38 +197,51 @@ impl DnsCodec {
             query_name.pop();
         }
         
-        // Check if query matches any of our expected domains
+        // Normalize to lowercase for case-insensitive matching (DNS is case-insensitive)
+        let query_name_lower = query_name.to_lowercase();
+        
+        // Check if query matches any of our expected domains (case-insensitive)
         let domain_match = expected_domains.iter().any(|domain| {
+            let domain_lower = domain.to_lowercase();
             // Check if query ends with .domain or just domain, and has content before it
-            (query_name.ends_with(&format!(".{}", domain)) || query_name == domain.as_str()) 
-            && query_name.len() > domain.len()
+            (query_name_lower.ends_with(&format!(".{}", domain_lower)) || query_name_lower == domain_lower.as_str()) 
+            && query_name_lower.len() > domain_lower.len()
         });
 
         if !domain_match {
-            log::debug!("decode_from_dns_query: Query '{}' does not match expected domains: {:?}", 
-                       query_name, expected_domains);
+            log::debug!("decode_from_dns_query: Query '{}' (lowercase: '{}') does not match expected domains: {:?}", 
+                       query_name, query_name_lower, expected_domains);
             return Ok(None);
         }
 
         // Extract subdomain (everything before the domain)
         // Find the longest matching domain to handle cases like "tunnel.example.com" vs "example.com"
+        // Use lowercase comparison for matching
         let domain = expected_domains.iter()
             .filter(|d| {
-                let domain_with_dot = format!(".{}", d);
-                query_name.ends_with(&domain_with_dot) || query_name == d.as_str()
+                let domain_lower = d.to_lowercase();
+                let domain_with_dot = format!(".{}", domain_lower);
+                query_name_lower.ends_with(&domain_with_dot) || query_name_lower == domain_lower.as_str()
             })
             .max_by_key(|d| d.len())
             .ok_or_else(|| anyhow!("Domain not found"))?;
         
         // Extract subdomain part - remove the domain suffix
-        let full_subdomain = if query_name == domain.as_str() {
+        // Use original query_name (preserve case for hex decoding) but lowercase domain for matching
+        let domain_lower = domain.to_lowercase();
+        let full_subdomain = if query_name_lower == domain_lower.as_str() {
             // No subdomain, just the domain
             return Err(anyhow!("Query has no subdomain"));
         } else {
             // Remove .domain suffix (with dot) - this is the most common case
-            if let Some(stripped) = query_name.strip_suffix(&format!(".{}", domain)) {
-                stripped
-            } else if query_name.ends_with(domain) {
+            // Match case-insensitively but extract from original query_name
+            if query_name_lower.ends_with(&format!(".{}", domain_lower)) {
+                // Find the position in original query_name
+                let domain_len = domain.len();
+                let query_len = query_name.len();
+                // The domain should be at the end, so we can safely extract
+                &query_name[..query_len - domain_len - 1] // -1 for the dot
+            } else if query_name_lower.ends_with(&domain_lower) {
                 // Handle case where domain doesn't have leading dot in query (unlikely but possible)
                 let potential = &query_name[..query_name.len() - domain.len()];
                 // Remove leading dot if present
@@ -406,35 +419,46 @@ impl DnsCodec {
                 let name = answer.name().to_ascii();
                 let name_str = name.trim_end_matches('.');
                 
-                // Check if name matches any of our expected domains
+                // Normalize to lowercase for case-insensitive matching (DNS is case-insensitive)
+                let name_str_lower = name_str.to_lowercase();
+                
+                // Check if name matches any of our expected domains (case-insensitive)
                 let domain_match = expected_domains.iter().any(|domain| {
-                    (name_str.ends_with(&format!(".{}", domain)) || name_str == domain.as_str())
-                        && name_str.len() > domain.len()
+                    let domain_lower = domain.to_lowercase();
+                    (name_str_lower.ends_with(&format!(".{}", domain_lower)) || name_str_lower == domain_lower.as_str())
+                        && name_str_lower.len() > domain_lower.len()
                 });
                 // #region agent log
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/.cursor/debug.log") {
-                    let _ = writeln!(f, r#"{{"hypothesisId":"D2","location":"dns_codec.rs:340","message":"domain_match_check","data":{{"name_str":"{}","domain_match":{}}},"timestamp":{}}}"#, 
-                        name_str, domain_match,
+                    let _ = writeln!(f, r#"{{"hypothesisId":"D2","location":"dns_codec.rs:340","message":"domain_match_check","data":{{"name_str":"{}","name_str_lower":"{}","domain_match":{}}},"timestamp":{}}}"#, 
+                        name_str, name_str_lower, domain_match,
                         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
                 }
                 // #endregion
 
                 if domain_match {
-                    // Extract subdomain
+                    // Extract subdomain (case-insensitive matching)
                     let domain = expected_domains.iter()
                         .filter(|d| {
-                            let domain_with_dot = format!(".{}", d);
-                            name_str.ends_with(&domain_with_dot) || name_str == d.as_str()
+                            let domain_lower = d.to_lowercase();
+                            let domain_with_dot = format!(".{}", domain_lower);
+                            name_str_lower.ends_with(&domain_with_dot) || name_str_lower == domain_lower.as_str()
                         })
                         .max_by_key(|d| d.len())
                         .ok_or_else(|| anyhow!("Domain not found"))?;
                     
-                    let full_subdomain = if name_str == domain.as_str() {
+                    // Use original name_str (preserve case for hex decoding) but lowercase domain for matching
+                    let domain_lower = domain.to_lowercase();
+                    let full_subdomain = if name_str_lower == domain_lower.as_str() {
                         return Err(anyhow!("Response has no subdomain"));
                     } else {
-                        if let Some(stripped) = name_str.strip_suffix(&format!(".{}", domain)) {
-                            stripped
-                        } else if name_str.ends_with(domain) {
+                        if name_str_lower.ends_with(&format!(".{}", domain_lower)) {
+                            // Find the position in original name_str
+                            let domain_len = domain.len();
+                            let name_len = name_str.len();
+                            // The domain should be at the end, so we can safely extract
+                            &name_str[..name_len - domain_len - 1] // -1 for the dot
+                        } else if name_str_lower.ends_with(&domain_lower) {
                             name_str[..name_str.len() - domain.len()].trim_start_matches('.')
                         } else {
                             return Err(anyhow!("Invalid response format"));

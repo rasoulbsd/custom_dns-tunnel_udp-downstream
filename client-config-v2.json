@@ -12,7 +12,7 @@
       "fec_enabled": false,
       "redundancy_factor": 2,
       "load_balance_strategy": "least_latency",
-      "prefer_transports": ["doq", "doh", "dns_udp"],
+      "prefer_transports": ["dns_udp"],
       "adaptive_window": true,
       "adaptive_payload": true
     },
@@ -26,19 +26,18 @@
       "fec_parity_ratio": 0.1,
       "redundancy_factor": 1,
       "load_balance_strategy": "bandwidth_first",
-      "prefer_transports": ["doq", "direct_udp", "doh"]
+      "prefer_transports": ["dns_udp"]
     }
   },
   
-  "domains": ["tunnel.example.com"],
+  "domains": ["us.meonme.ir"],
   
   "resolvers": {
     "db_path": "./resolvers.redb",
     "watch_file": "./resolvers.txt",
     "initial": [
       {"addr": "1.1.1.1:53", "transport": "dns_udp"},
-      {"addr": "8.8.8.8:53", "transport": "dns_udp"},
-      {"addr": "https://cloudflare-dns.com/dns-query", "transport": "doh"}
+      {"addr": "8.8.8.8:53", "transport": "dns_udp"}
     ]
   },
   
@@ -51,8 +50,8 @@
   },
   
   "server": {
-    "udp_addr": "your-server.example.com:5354",
-    "direct_udp_enabled": true
+    "udp_addr": null,
+    "direct_udp_enabled": false
   },
   
   "advanced": {
