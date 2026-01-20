@@ -140,18 +140,17 @@ async fn main() -> Result<()> {
         .context("Failed to bind local UDP socket")?);
     info!("Bound to local UDP: {}", local_udp);
     
-    // Create separate sockets for DNS queries and responses
-    // This allows better separation for monitoring and debugging
+    // Create socket for DNS queries
+    // CRITICAL: DNS responses come back to the SAME port we send queries from (via resolver),
+    // so we must use dns_query_socket for both sending queries AND receiving responses
     let dns_query_socket = Arc::new(UdpSocket::bind("0.0.0.0:0")
         .await
         .context("Failed to bind DNS query socket")?);
     
-    // Separate socket for receiving DNS responses (if DNS or hybrid mode)
-    // This makes it easier to monitor DNS traffic separately from UDP
+    // For DNS/hybrid mode, we receive responses on dns_query_socket (same socket we send from)
+    // This is because DNS responses come back through the resolver to our query source port
     let dns_response_socket = if matches!(config.response_mode, ResponseMode::Dns | ResponseMode::Hybrid | ResponseMode::HybridAlias) {
-        Some(Arc::new(UdpSocket::bind("0.0.0.0:0")
-            .await
-            .context("Failed to bind DNS response socket")?))
+        Some(dns_query_socket.clone()) // Use the same socket for receiving responses
     } else {
         None
     };
