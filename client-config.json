@@ -1,24 +1,23 @@
 {
-  "local_udp": "127.0.0.1:5355",
+  "local_udp": "0.0.0.0:5355",
   "uplink_mode": "dns",
   "response_mode": "dns",
   "server_udp_addr": "127.0.0.1:5354",
-  "domains": [
-    "us.meonme.ir"
-  ],
+  "domains": ["us.meonme.ir"],
   "resolvers": [
     "46.245.90.90:53",
     "2.189.1.40:53",
-    "2.188.21.130:53",
-    "217.218.26.77:53",
-    "217.218.26.78:53"
+    "2.188.21.130:53"
   ],
-  "max_subdomain_length": 63,
-  "min_subdomain_length": 20,
+  "max_subdomain_length": 120,
+  "min_subdomain_length": 50,
   "rotate_resolvers": true,
-  "randomize_local_port": false,
-  "plain_mode": false,
-  "retry_timeout_ms": 100,
-  "max_retries": 10,
-  "query_socket_pool_size": 5
+  
+  "record_types": ["TXT", "A", "AAAA", "CNAME", "NS", "MX"],
+  "broadcast_mode": "full",
+  "enable_nack": true,
+  "nack_delay_ms": 50,
+  "nack_interval_ms": 100,
+  "source_port_rotation_interval_ms": 30000,
+  "socks5_bind": "127.0.0.1:1080"
 }

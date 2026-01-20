@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use dns_tunnel::{
-    config::{load_server_config, ResponseMode, ServerConfig},
-    dns_codec::DnsCodec,
-    packet::{fragment_packet, PacketReassembler},
+    config::{load_server_config, ResponseMode, ServerConfig, BroadcastMode},
+    dns_codec::{DnsCodec, TunnelRecordType},
+    packet::{fragment_packet, PacketReassembler, NackPacket, PacketFlags},
+    session::{SessionManager, SessionPacket, SessionType, SessionFlags, SessionState},
+    socks5::{Socks5Server, Socks5Connection, Command, ReplyCode},
     utils::get_random_port,
 };
 use futures::future::join_all;
@@ -15,7 +17,8 @@ use log::{debug, error, info, warn};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 use std::hash::{Hash, Hasher};
@@ -123,7 +126,25 @@ async fn main() -> Result<()> {
     };
 
     let codec = Arc::new(DnsCodec::new_with_min(config.max_subdomain_length, config.min_subdomain_length));
-    let reassembler = Arc::new(Mutex::new(PacketReassembler::new()));
+    let reassembler = Arc::new(Mutex::new(PacketReassembler::with_nack_config(
+        config.nack_delay_ms,
+        config.nack_interval_ms,
+    )));
+    
+    // Parse configured record types for multi-record broadcast responses
+    let record_types: Vec<TunnelRecordType> = config.record_types.iter()
+        .filter_map(|s| TunnelRecordType::from_str(s))
+        .collect();
+    let record_types = if record_types.is_empty() {
+        vec![TunnelRecordType::TXT]
+    } else {
+        record_types
+    };
+    info!("[BROADCAST] Response record types: {:?}, Mode: {:?}", 
+          config.record_types, config.broadcast_mode);
+    let record_types = Arc::new(record_types);
+    let broadcast_mode = config.broadcast_mode.clone();
+    
     // Map: packet_id -> (reply_addr, query_id, domain)
     //
     // - For DNS uplink, reply_addr is the resolver/client socket that sent the DNS query (IP:port).
@@ -309,6 +330,8 @@ async fn main() -> Result<()> {
             let response_mode = config.response_mode.clone();
             let plain_mode = config.plain_mode;
             let domains_for_response = config.domains.clone(); // Used for spam mode DNS responses
+            let record_types_clone = record_types.clone(); // For multi-record type broadcast
+            let broadcast_mode_clone = broadcast_mode.clone();
             let data_hash_to_packet = data_hash_to_packet.clone();
             let response_queue = response_queue.clone();
             let pending_requests_for_response = pending_requests.clone();
@@ -459,8 +482,10 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     ResponseMode::Dns => {
-                                        // DNS only mode - SPAM MODE: send for ALL domains in PARALLEL
-                                        info!("[DNS-RESPONSE] Mode: DNS only (parallel spam: {} domains)", domains_for_response.len());
+                                        // DNS only mode - SPAM MODE: send for ALL domains x ALL record types in PARALLEL
+                                        let num_record_types = record_types_clone.len();
+                                        info!("[DNS-RESPONSE] Mode: DNS only (parallel spam: {} domains x {} record types)", 
+                                              domains_for_response.len(), num_record_types);
                                         let max_chunk = domains_for_response
                                             .iter()
                                             .map(|d| codec.max_payload_per_query_for_domain(d))
@@ -469,9 +494,13 @@ async fn main() -> Result<()> {
                                         let fragments = fragment_packet(data, max_chunk);
                                         let total_fragments = fragments.len() as u8;
                                         
-                                        info!("[DNS-RESPONSE] Fragmenting into {} fragments x {} domains = {} total sends", 
-                                              total_fragments, domains_for_response.len(), 
-                                              total_fragments as usize * domains_for_response.len());
+                                        let total_sends = match broadcast_mode_clone {
+                                            BroadcastMode::Full => total_fragments as usize * domains_for_response.len() * num_record_types,
+                                            BroadcastMode::Rotate | BroadcastMode::Single => total_fragments as usize * domains_for_response.len(),
+                                        };
+                                        
+                                        info!("[DNS-RESPONSE] Fragmenting into {} fragments x {} domains x {} types = {} total sends", 
+                                              total_fragments, domains_for_response.len(), num_record_types, total_sends);
                                         
                                         if let Some(ref sock) = dns_socket_for_response {
                                             // DNS replies only make sense if we have a real DNS query_id.
@@ -480,17 +509,32 @@ async fn main() -> Result<()> {
                                                 continue;
                                             }
                                             
-                                            // Pre-encode all DNS responses for all domains and fragments
+                                            // Pre-encode all DNS responses for all domains, record types, and fragments
                                             let mut dns_packets: Vec<(String, u8, Vec<u8>)> = Vec::new();
+                                            let mut type_idx = 0usize;
+                                            
                                             for spam_domain in &domains_for_response {
                                                 for (fragment_id, fragment_data) in fragments.iter().enumerate() {
-                                                    match codec.encode_to_dns_response(
+                                                    // Determine which record types to use
+                                                    let types_to_use: Vec<TunnelRecordType> = match broadcast_mode_clone {
+                                                        BroadcastMode::Full => record_types_clone.to_vec(),
+                                                        BroadcastMode::Rotate => {
+                                                            let t = record_types_clone[type_idx % num_record_types];
+                                                            type_idx += 1;
+                                                            vec![t]
+                                                        }
+                                                        BroadcastMode::Single => vec![record_types_clone[0]],
+                                                    };
+                                                    
+                                                    for record_type in types_to_use {
+                                                        match codec.encode_to_dns_response_typed(
                                                         fragment_data,
                                                         spam_domain,
                                                         response_packet_id,
                                                         fragment_id as u8,
                                                         total_fragments,
                                                         query_id,
+                                                            record_type,
                                                     ) {
                                                         Ok(dns_response) => {
                                                             let mut buf = Vec::new();
@@ -502,7 +546,8 @@ async fn main() -> Result<()> {
                                                             dns_packets.push((spam_domain.clone(), fragment_id as u8, encoder.into_bytes().to_vec()));
                                                         }
                                                         Err(e) => {
-                                                            warn!("Failed to encode DNS response: {}", e);
+                                                                warn!("Failed to encode DNS response ({:?}): {}", record_type, e);
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -536,7 +581,8 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     ResponseMode::Hybrid | ResponseMode::HybridAlias => {
-                                        // Hybrid mode: send both UDP and DNS in PARALLEL
+                                        // Hybrid mode: send both UDP and DNS in PARALLEL with multi-record type broadcast
+                                        let num_record_types = record_types_clone.len();
                                         let max_chunk_udp = 65507 - 4; // Max UDP size minus header
                                         let fragments_udp = fragment_packet(data, max_chunk_udp);
                                         let total_fragments_udp = fragments_udp.len() as u8;
@@ -549,10 +595,14 @@ async fn main() -> Result<()> {
                                         let fragments_dns = fragment_packet(data, max_chunk_dns);
                                         let total_fragments_dns = fragments_dns.len() as u8;
                                         
+                                        let dns_multiplier = match broadcast_mode_clone {
+                                            BroadcastMode::Full => domains_for_response.len() * num_record_types,
+                                            BroadcastMode::Rotate | BroadcastMode::Single => domains_for_response.len(),
+                                        };
                                         let total_sends = total_fragments_udp as usize + 
-                                            (if query_id != 0 { total_fragments_dns as usize * domains_for_response.len() } else { 0 });
-                                        info!("[HYBRID-RESPONSE] Parallel send: {} UDP + {} DNS x {} domains = {} total", 
-                                              total_fragments_udp, total_fragments_dns, domains_for_response.len(), total_sends);
+                                            (if query_id != 0 { total_fragments_dns as usize * dns_multiplier } else { 0 });
+                                        info!("[HYBRID-RESPONSE] Parallel send: {} UDP + {} DNS x {} domains x {} types = {} total", 
+                                              total_fragments_udp, total_fragments_dns, domains_for_response.len(), num_record_types, total_sends);
                                         
                                         // Collect all send tasks for parallel execution
                                         let mut all_tasks: Vec<tokio::task::JoinHandle<Result<(), std::io::Error>>> = Vec::new();
@@ -587,19 +637,34 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                         
-                                        // Prepare and spawn DNS send tasks (spam mode - all domains in parallel)
+                                        // Prepare and spawn DNS send tasks (spam mode - all domains x all record types)
                                         if let Some(ref sock) = dns_socket_for_response {
                                             if query_id != 0 {
                                                 let sock_clone = Arc::clone(sock);
+                                                let mut type_idx = 0usize;
+                                                
                                                 for spam_domain in &domains_for_response {
                                                     for (fragment_id, fragment_data) in fragments_dns.iter().enumerate() {
-                                                        match codec.encode_to_dns_response(
+                                                        // Determine which record types to use
+                                                        let types_to_use: Vec<TunnelRecordType> = match broadcast_mode_clone {
+                                                            BroadcastMode::Full => record_types_clone.to_vec(),
+                                                            BroadcastMode::Rotate => {
+                                                                let t = record_types_clone[type_idx % num_record_types];
+                                                                type_idx += 1;
+                                                                vec![t]
+                                                            }
+                                                            BroadcastMode::Single => vec![record_types_clone[0]],
+                                                        };
+                                                        
+                                                        for record_type in types_to_use {
+                                                            match codec.encode_to_dns_response_typed(
                                                             fragment_data,
                                                             spam_domain,
                                                             response_packet_id,
                                                             fragment_id as u8,
                                                             total_fragments_dns,
                                                             query_id,
+                                                                record_type,
                                                         ) {
                                                             Ok(dns_response) => {
                                                                 let mut buf = Vec::new();
@@ -630,7 +695,8 @@ async fn main() -> Result<()> {
                                                                 }));
                                                             }
                                                             Err(e) => {
-                                                                warn!("Failed to encode DNS response: {}", e);
+                                                                    warn!("Failed to encode DNS response ({:?}): {}", record_type, e);
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -658,6 +724,52 @@ async fn main() -> Result<()> {
                 }
             });
         }
+    }
+
+    // Session manager for bi-directional SOCKS5 connections
+    let session_manager: Arc<Mutex<SessionManager>> = Arc::new(Mutex::new(SessionManager::new()));
+    
+    // Spawn SOCKS5 server if configured (for reverse proxy functionality)
+    if let Some(socks5_addr) = config.socks5_bind {
+        let session_manager_socks = session_manager.clone();
+        let dns_socket_socks = dns_socket.clone();
+        let codec_socks = codec.clone();
+        let domains_socks = config.domains.clone();
+        
+        tokio::spawn(async move {
+            match Socks5Server::bind(socks5_addr).await {
+                Ok(socks5_server) => {
+                    info!("[SOCKS5] Reverse proxy server started on {}", socks5_addr);
+                    
+                    loop {
+                        match socks5_server.accept().await {
+                            Ok((stream, client_addr)) => {
+                                info!("[SOCKS5] Reverse: Accepted connection from {}", client_addr);
+                                
+                                let session_manager = session_manager_socks.clone();
+                                
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_server_socks5_client(
+                                        stream,
+                                        client_addr,
+                                        session_manager,
+                                    ).await {
+                                        warn!("[SOCKS5] Reverse: Client {} error: {}", client_addr, e);
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                error!("[SOCKS5] Reverse: Accept error: {}", e);
+                                sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("[SOCKS5] Failed to bind reverse proxy server on {}: {}", socks5_addr, e);
+                }
+            }
+        });
     }
 
     // Main loop: receive DNS queries (or plain UDP in plain mode) and forward as UDP
@@ -843,4 +955,101 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// Handle a SOCKS5 client connection on the server side (reverse proxy)
+/// This allows connections from the server side to be forwarded through the tunnel to the client
+async fn handle_server_socks5_client(
+    stream: TcpStream,
+    client_addr: SocketAddr,
+    session_manager: Arc<Mutex<SessionManager>>,
+) -> anyhow::Result<()> {
+    use tokio::sync::mpsc;
+    
+    let mut conn = Socks5Connection::from_stream(stream, client_addr).await
+        .context("SOCKS5 handshake failed")?;
+    
+    match conn.request.command {
+        Command::Connect => {
+            // Resolve target address
+            let target_addr = conn.request.target.resolve().await
+                .context("Failed to resolve target address")?;
+            
+            info!("[SOCKS5-REVERSE] CONNECT request: {} -> {}", client_addr, target_addr);
+            
+            // For reverse SOCKS5, we need to forward the connection through the tunnel
+            // to the client, which will then connect to the target
+            let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(256);
+            let session_id = {
+                let mut mgr = session_manager.lock().await;
+                mgr.create_session(SessionType::Tcp, Some(target_addr), data_tx)
+            };
+            
+            // In a full implementation, we would:
+            // 1. Send a SYN packet through the tunnel to the client
+            // 2. Wait for SYN-ACK from client confirming connection to target
+            // 3. Then send success to the SOCKS5 client
+            // 4. Forward data bi-directionally
+            
+            // For now, we send success immediately (simplified)
+            conn.send_success(target_addr).context("Failed to send SOCKS5 success")?;
+            
+            let (mut read_half, mut write_half) = conn.stream.into_split();
+            
+            // Read from SOCKS5 client, forward through tunnel
+            let session_id_read = session_id;
+            let session_manager_read = session_manager.clone();
+            
+            let read_task = tokio::spawn(async move {
+                let mut buf = vec![0u8; 65535];
+                loop {
+                    match read_half.read(&mut buf).await {
+                        Ok(0) => {
+                            debug!("[SOCKS5-REVERSE] Client closed connection");
+                            break;
+                        }
+                        Ok(n) => {
+                            // In full implementation, forward data through tunnel
+                            let _data = &buf[..n];
+                            debug!("[SOCKS5-REVERSE] Received {} bytes from client", n);
+                            // TODO: Send through tunnel to client
+                        }
+                        Err(e) => {
+                            warn!("[SOCKS5-REVERSE] Read error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+            
+            // Write data from tunnel to SOCKS5 client
+            let write_task = tokio::spawn(async move {
+                while let Some(data) = data_rx.recv().await {
+                    if let Err(e) = write_half.write_all(&data).await {
+                        warn!("[SOCKS5-REVERSE] Write error: {}", e);
+                        break;
+                    }
+                }
+            });
+            
+            tokio::select! {
+                _ = read_task => {}
+                _ = write_task => {}
+            }
+            
+            // Clean up session
+            {
+                let mut mgr = session_manager.lock().await;
+                mgr.close(session_id);
+            }
+            
+            info!("[SOCKS5-REVERSE] Connection closed: {} (session {})", client_addr, session_id);
+        }
+        Command::UdpAssociate | Command::Bind => {
+            conn.send_failure(ReplyCode::CommandNotSupported).await
+                .context("Failed to send SOCKS5 failure")?;
+        }
+    }
+    
+    Ok(())
 }

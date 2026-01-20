@@ -1,10 +1,73 @@
-use crate::packet::TunnelPacket;
+use crate::packet::{NackPacket, PacketFlags, TunnelPacket};
 use anyhow::{anyhow, Result};
 use hickory_proto::{
     op::{Message, MessageType, OpCode, Query},
     rr::{Name, RecordType},
 };
 use rand::Rng;
+
+/// Supported DNS record types for tunnel encoding
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TunnelRecordType {
+    TXT,
+    A,
+    AAAA,
+    CNAME,
+    MX,
+    NS,
+    NULL,
+}
+
+impl TunnelRecordType {
+    pub fn to_dns_record_type(&self) -> RecordType {
+        match self {
+            TunnelRecordType::TXT => RecordType::TXT,
+            TunnelRecordType::A => RecordType::A,
+            TunnelRecordType::AAAA => RecordType::AAAA,
+            TunnelRecordType::CNAME => RecordType::CNAME,
+            TunnelRecordType::MX => RecordType::MX,
+            TunnelRecordType::NS => RecordType::NS,
+            TunnelRecordType::NULL => RecordType::NULL,
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "TXT" => Some(TunnelRecordType::TXT),
+            "A" => Some(TunnelRecordType::A),
+            "AAAA" => Some(TunnelRecordType::AAAA),
+            "CNAME" => Some(TunnelRecordType::CNAME),
+            "MX" => Some(TunnelRecordType::MX),
+            "NS" => Some(TunnelRecordType::NS),
+            "NULL" => Some(TunnelRecordType::NULL),
+            _ => None,
+        }
+    }
+
+    pub fn all() -> Vec<TunnelRecordType> {
+        vec![
+            TunnelRecordType::TXT,
+            TunnelRecordType::A,
+            TunnelRecordType::AAAA,
+            TunnelRecordType::CNAME,
+            TunnelRecordType::MX,
+            TunnelRecordType::NS,
+        ]
+    }
+
+    /// Get the response capacity in bytes for this record type
+    pub fn response_capacity(&self) -> usize {
+        match self {
+            TunnelRecordType::TXT => 250,   // ~255 bytes per TXT string
+            TunnelRecordType::A => 64,      // Multiple A records, 4 bytes each
+            TunnelRecordType::AAAA => 256,  // Multiple AAAA records, 16 bytes each
+            TunnelRecordType::CNAME => 200, // Name-based encoding
+            TunnelRecordType::MX => 200,    // Name-based with preference
+            TunnelRecordType::NS => 200,    // Name-based encoding
+            TunnelRecordType::NULL => 512,  // Raw binary (if supported)
+        }
+    }
+}
 
 pub struct DnsCodec {
     max_subdomain_length: usize,
@@ -311,7 +374,53 @@ impl DnsCodec {
             packet_id,
             fragment_id,
             total_fragments,
+            flags: PacketFlags::Data,
+            session_id: 0,
         }))
+    }
+
+    /// Encode NACK packet for UDP transmission
+    pub fn encode_nack_packet(&self, nack: &NackPacket) -> Vec<u8> {
+        let mut packet_data = Vec::with_capacity(5 + nack.missing_bitmap.len());
+        packet_data.extend_from_slice(&nack.packet_id.to_be_bytes());
+        packet_data.push(0); // fragment_id = 0 for NACK
+        packet_data.push(nack.total_fragments);
+        packet_data.push(PacketFlags::Nack as u8); // Flags byte indicating NACK
+        packet_data.extend_from_slice(&nack.missing_bitmap);
+        packet_data
+    }
+
+    /// Decode NACK packet from UDP data
+    pub fn decode_nack_packet(&self, data: &[u8]) -> Option<NackPacket> {
+        if data.len() < 5 {
+            return None;
+        }
+        
+        let packet_id = u16::from_be_bytes([data[0], data[1]]);
+        // data[2] is fragment_id (unused for NACK)
+        let total_fragments = data[3];
+        let flags = data[4];
+        
+        // Check if this is a NACK packet
+        if flags != PacketFlags::Nack as u8 {
+            return None;
+        }
+        
+        let missing_bitmap = data[5..].to_vec();
+        
+        Some(NackPacket {
+            packet_id,
+            total_fragments,
+            missing_bitmap,
+        })
+    }
+
+    /// Check if UDP packet is a NACK
+    pub fn is_nack_packet(&self, data: &[u8]) -> bool {
+        if data.len() < 5 {
+            return false;
+        }
+        data[4] == PacketFlags::Nack as u8
     }
 
     /// Encode UDP packet data into DNS response
@@ -515,6 +624,425 @@ impl DnsCodec {
             packet_id,
             fragment_id,
             total_fragments,
+            flags: PacketFlags::Data,
+            session_id: 0,
         }))
+    }
+
+    // ============================================================
+    // Multi-Record Type Encoding (for broadcast mode)
+    // ============================================================
+
+    /// Encode to DNS query with specified record type
+    pub fn encode_to_dns_query_typed(
+        &self,
+        data: &[u8],
+        domain: &str,
+        packet_id: u16,
+        fragment_id: u8,
+        total_fragments: u8,
+        record_type: TunnelRecordType,
+    ) -> Result<Message> {
+        // Create packet header: packet_id (2 bytes) + fragment_id (1) + total_fragments (1) + data
+        let mut packet_data = Vec::with_capacity(4 + data.len());
+        packet_data.extend_from_slice(&packet_id.to_be_bytes());
+        packet_data.push(fragment_id);
+        packet_data.push(total_fragments);
+        packet_data.extend_from_slice(data);
+
+        // Encode to hex
+        let encoded = hex::encode(&packet_data);
+        
+        let max_payload = self.max_payload_per_query_for_domain(domain);
+        let max_encoded_len = (max_payload + 4) * 2;
+        let subdomain = if max_payload > 0 && encoded.len() > max_encoded_len {
+            let truncate_len = (max_encoded_len / 2) * 2;
+            &encoded[..truncate_len]
+        } else {
+            &encoded
+        };
+
+        // Generate random 6-char hex prefix
+        let random_bytes: [u8; 3] = rand::thread_rng().gen();
+        let random_prefix = hex::encode(random_bytes);
+
+        // Create DNS query
+        let mut message = Message::new();
+        message.set_id(rand::thread_rng().gen());
+        message.set_message_type(MessageType::Query);
+        message.set_op_code(OpCode::Query);
+        message.set_recursion_desired(true);
+
+        // Build query name
+        let query_name = self.build_name_with_prefix(&random_prefix, subdomain, domain)?;
+        let name = Name::from_ascii(&query_name)
+            .map_err(|e| anyhow!("Failed to create DNS name: {}", e))?;
+
+        // Add question with specified record type
+        let query = Query::query(name, record_type.to_dns_record_type());
+        message.add_query(query);
+
+        Ok(message)
+    }
+
+    /// Encode to DNS response with specified record type
+    pub fn encode_to_dns_response_typed(
+        &self,
+        data: &[u8],
+        domain: &str,
+        packet_id: u16,
+        fragment_id: u8,
+        total_fragments: u8,
+        query_id: u16,
+        record_type: TunnelRecordType,
+    ) -> Result<Message> {
+        use hickory_proto::rr::{rdata, Record, RData};
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        // Create packet header
+        let mut packet_data = Vec::with_capacity(4 + data.len());
+        packet_data.extend_from_slice(&packet_id.to_be_bytes());
+        packet_data.push(fragment_id);
+        packet_data.push(total_fragments);
+        packet_data.extend_from_slice(data);
+
+        let encoded = hex::encode(&packet_data);
+        
+        let max_payload = self.max_payload_per_query_for_domain(domain);
+        let max_encoded_len = (max_payload + 4) * 2;
+        let subdomain = if max_payload > 0 && encoded.len() > max_encoded_len {
+            let truncate_len = (max_encoded_len / 2) * 2;
+            &encoded[..truncate_len]
+        } else {
+            &encoded
+        };
+
+        let random_bytes: [u8; 3] = rand::thread_rng().gen();
+        let random_prefix = hex::encode(random_bytes);
+
+        let mut message = Message::new();
+        message.set_id(query_id);
+        message.set_message_type(MessageType::Response);
+        message.set_op_code(OpCode::Query);
+        message.set_recursion_desired(true);
+
+        let response_name = self.build_name_with_prefix(&random_prefix, subdomain, domain)?;
+        let name = Name::from_ascii(&response_name)
+            .map_err(|e| anyhow!("Failed to create DNS name: {}", e))?;
+
+        match record_type {
+            TunnelRecordType::TXT => {
+                let mut record = Record::new();
+                record.set_name(name.clone());
+                record.set_record_type(RecordType::TXT);
+                record.set_ttl(0);
+                record.set_data(Some(RData::TXT(rdata::TXT::new(vec![subdomain.to_string()]))));
+                message.add_answer(record);
+            }
+            TunnelRecordType::A => {
+                // Encode data into multiple A records (4 bytes each)
+                let hex_bytes = hex::decode(subdomain).unwrap_or_default();
+                for chunk in hex_bytes.chunks(4) {
+                    let mut ip_bytes = [0u8; 4];
+                    for (i, &b) in chunk.iter().enumerate() {
+                        ip_bytes[i] = b;
+                    }
+                    let ip = Ipv4Addr::from(ip_bytes);
+                    let mut record = Record::new();
+                    record.set_name(name.clone());
+                    record.set_record_type(RecordType::A);
+                    record.set_ttl(0);
+                    record.set_data(Some(RData::A(rdata::A(ip))));
+                    message.add_answer(record);
+                }
+            }
+            TunnelRecordType::AAAA => {
+                // Encode data into multiple AAAA records (16 bytes each)
+                let hex_bytes = hex::decode(subdomain).unwrap_or_default();
+                for chunk in hex_bytes.chunks(16) {
+                    let mut ip_bytes = [0u8; 16];
+                    for (i, &b) in chunk.iter().enumerate() {
+                        ip_bytes[i] = b;
+                    }
+                    let ip = Ipv6Addr::from(ip_bytes);
+                    let mut record = Record::new();
+                    record.set_name(name.clone());
+                    record.set_record_type(RecordType::AAAA);
+                    record.set_ttl(0);
+                    record.set_data(Some(RData::AAAA(rdata::AAAA(ip))));
+                    message.add_answer(record);
+                }
+            }
+            TunnelRecordType::CNAME | TunnelRecordType::NS => {
+                // Encode data as name labels
+                let target_name = self.build_name_with_prefix(&random_prefix, subdomain, domain)?;
+                let target = Name::from_ascii(&target_name)
+                    .map_err(|e| anyhow!("Failed to create target name: {}", e))?;
+                let mut record = Record::new();
+                record.set_name(name.clone());
+                if record_type == TunnelRecordType::CNAME {
+                    record.set_record_type(RecordType::CNAME);
+                    record.set_data(Some(RData::CNAME(rdata::CNAME(target))));
+                } else {
+                    record.set_record_type(RecordType::NS);
+                    record.set_data(Some(RData::NS(rdata::NS(target))));
+                }
+                record.set_ttl(0);
+                message.add_answer(record);
+            }
+            TunnelRecordType::MX => {
+                let target_name = self.build_name_with_prefix(&random_prefix, subdomain, domain)?;
+                let target = Name::from_ascii(&target_name)
+                    .map_err(|e| anyhow!("Failed to create MX target: {}", e))?;
+                let mut record = Record::new();
+                record.set_name(name.clone());
+                record.set_record_type(RecordType::MX);
+                record.set_ttl(0);
+                record.set_data(Some(RData::MX(rdata::MX::new(10, target))));
+                message.add_answer(record);
+            }
+            TunnelRecordType::NULL => {
+                // NULL record - raw binary data
+                let hex_bytes = hex::decode(subdomain).unwrap_or_default();
+                let mut record = Record::new();
+                record.set_name(name.clone());
+                record.set_record_type(RecordType::NULL);
+                record.set_ttl(0);
+                record.set_data(Some(RData::NULL(rdata::NULL::with(hex_bytes))));
+                message.add_answer(record);
+            }
+        }
+
+        Ok(message)
+    }
+
+    /// Decode DNS response trying all known record types
+    pub fn decode_from_dns_response_any(&self, message: &Message, expected_domains: &[String]) -> Result<Option<TunnelPacket>> {
+        if message.message_type() != MessageType::Response {
+            return Ok(None);
+        }
+
+        // Try each answer record
+        for answer in message.answers() {
+            let name = answer.name().to_ascii();
+            let name_str = name.trim_end_matches('.');
+            
+            // Check domain match
+            let domain_match = expected_domains.iter().any(|domain| {
+                (name_str.ends_with(&format!(".{}", domain)) || name_str == domain.as_str())
+                    && name_str.len() > domain.len()
+            });
+
+            if !domain_match {
+                continue;
+            }
+
+            // Try to decode based on record type
+            let result = match answer.record_type() {
+                RecordType::TXT => self.decode_txt_response(answer, expected_domains),
+                RecordType::A => self.decode_a_response(message, expected_domains),
+                RecordType::AAAA => self.decode_aaaa_response(message, expected_domains),
+                RecordType::CNAME | RecordType::NS | RecordType::MX => {
+                    self.decode_name_response(answer, expected_domains)
+                }
+                RecordType::NULL => self.decode_null_response(answer),
+                _ => continue,
+            };
+
+            if let Ok(Some(packet)) = result {
+                return Ok(Some(packet));
+            }
+        }
+
+        // Fallback to query-based decoding
+        if !message.queries().is_empty() {
+            return self.decode_from_dns_query(message, expected_domains);
+        }
+
+        Ok(None)
+    }
+
+    fn decode_txt_response(&self, answer: &hickory_proto::rr::Record, expected_domains: &[String]) -> Result<Option<TunnelPacket>> {
+        use hickory_proto::rr::RData;
+        
+        if let Some(RData::TXT(txt)) = answer.data() {
+            let name = answer.name().to_ascii();
+            let name_str = name.trim_end_matches('.');
+            
+            // Extract subdomain
+            let domain = expected_domains.iter()
+                .filter(|d| {
+                    let domain_with_dot = format!(".{}", d);
+                    name_str.ends_with(&domain_with_dot) || name_str == d.as_str()
+                })
+                .max_by_key(|d| d.len());
+            
+            if let Some(domain) = domain {
+                let full_subdomain = if let Some(stripped) = name_str.strip_suffix(&format!(".{}", domain)) {
+                    stripped
+                } else {
+                    return Ok(None);
+                };
+                
+                // Strip random prefix
+                let parts: Vec<&str> = full_subdomain.split('.').collect();
+                let payload_parts = if parts.len() >= 2 && parts[0].len() == 6 && parts[0].chars().all(|c| c.is_ascii_hexdigit()) {
+                    &parts[1..]
+                } else {
+                    &parts[..]
+                };
+                let subdomain_part = payload_parts.join("");
+                
+                return self.decode_subdomain(&subdomain_part);
+            }
+        }
+        Ok(None)
+    }
+
+    fn decode_a_response(&self, message: &Message, expected_domains: &[String]) -> Result<Option<TunnelPacket>> {
+        use hickory_proto::rr::RData;
+        
+        // Collect all A record bytes
+        let mut all_bytes = Vec::new();
+        for answer in message.answers() {
+            if let Some(RData::A(a)) = answer.data() {
+                all_bytes.extend_from_slice(&a.0.octets());
+            }
+        }
+        
+        if all_bytes.len() < 4 {
+            return Ok(None);
+        }
+        
+        // Decode as tunnel packet
+        let packet_id = u16::from_be_bytes([all_bytes[0], all_bytes[1]]);
+        let fragment_id = all_bytes[2];
+        let total_fragments = all_bytes[3];
+        let data = all_bytes[4..].to_vec();
+        
+        // Basic validation
+        if total_fragments == 0 || total_fragments > 200 || fragment_id >= total_fragments {
+            return Ok(None);
+        }
+        
+        Ok(Some(TunnelPacket {
+            data,
+            source: "0.0.0.0:0".parse().unwrap(),
+            destination: "0.0.0.0:0".parse().unwrap(),
+            packet_id,
+            fragment_id,
+            total_fragments,
+            flags: PacketFlags::Data,
+            session_id: 0,
+        }))
+    }
+
+    fn decode_aaaa_response(&self, message: &Message, expected_domains: &[String]) -> Result<Option<TunnelPacket>> {
+        use hickory_proto::rr::RData;
+        
+        let mut all_bytes = Vec::new();
+        for answer in message.answers() {
+            if let Some(RData::AAAA(aaaa)) = answer.data() {
+                all_bytes.extend_from_slice(&aaaa.0.octets());
+            }
+        }
+        
+        if all_bytes.len() < 4 {
+            return Ok(None);
+        }
+        
+        let packet_id = u16::from_be_bytes([all_bytes[0], all_bytes[1]]);
+        let fragment_id = all_bytes[2];
+        let total_fragments = all_bytes[3];
+        let data = all_bytes[4..].to_vec();
+        
+        if total_fragments == 0 || total_fragments > 200 || fragment_id >= total_fragments {
+            return Ok(None);
+        }
+        
+        Ok(Some(TunnelPacket {
+            data,
+            source: "0.0.0.0:0".parse().unwrap(),
+            destination: "0.0.0.0:0".parse().unwrap(),
+            packet_id,
+            fragment_id,
+            total_fragments,
+            flags: PacketFlags::Data,
+            session_id: 0,
+        }))
+    }
+
+    fn decode_name_response(&self, answer: &hickory_proto::rr::Record, expected_domains: &[String]) -> Result<Option<TunnelPacket>> {
+        use hickory_proto::rr::RData;
+        
+        let target_name = match answer.data() {
+            Some(RData::CNAME(cname)) => cname.0.to_ascii(),
+            Some(RData::NS(ns)) => ns.0.to_ascii(),
+            Some(RData::MX(mx)) => mx.exchange().to_ascii(),
+            _ => return Ok(None),
+        };
+        
+        let name_str = target_name.trim_end_matches('.');
+        
+        // Find matching domain
+        let domain = expected_domains.iter()
+            .filter(|d| {
+                let domain_with_dot = format!(".{}", d);
+                name_str.ends_with(&domain_with_dot) || name_str == d.as_str()
+            })
+            .max_by_key(|d| d.len());
+        
+        if let Some(domain) = domain {
+            let full_subdomain = if let Some(stripped) = name_str.strip_suffix(&format!(".{}", domain)) {
+                stripped
+            } else {
+                return Ok(None);
+            };
+            
+            // Strip random prefix
+            let parts: Vec<&str> = full_subdomain.split('.').collect();
+            let payload_parts = if parts.len() >= 2 && parts[0].len() == 6 && parts[0].chars().all(|c| c.is_ascii_hexdigit()) {
+                &parts[1..]
+            } else {
+                &parts[..]
+            };
+            let subdomain_part = payload_parts.join("");
+            
+            return self.decode_subdomain(&subdomain_part);
+        }
+        
+        Ok(None)
+    }
+
+    fn decode_null_response(&self, answer: &hickory_proto::rr::Record) -> Result<Option<TunnelPacket>> {
+        use hickory_proto::rr::RData;
+        
+        if let Some(RData::NULL(null_data)) = answer.data() {
+            let data = null_data.anything().map(|d| d.to_vec()).unwrap_or_default();
+            if data.len() < 4 {
+                return Ok(None);
+            }
+            
+            let packet_id = u16::from_be_bytes([data[0], data[1]]);
+            let fragment_id = data[2];
+            let total_fragments = data[3];
+            let payload = data[4..].to_vec();
+            
+            if total_fragments == 0 || total_fragments > 200 || fragment_id >= total_fragments {
+                return Ok(None);
+            }
+            
+            return Ok(Some(TunnelPacket {
+                data: payload,
+                source: "0.0.0.0:0".parse().unwrap(),
+                destination: "0.0.0.0:0".parse().unwrap(),
+                packet_id,
+                fragment_id,
+                total_fragments,
+                flags: PacketFlags::Data,
+                session_id: 0,
+            }));
+        }
+        Ok(None)
     }
 }

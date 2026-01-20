@@ -19,6 +19,21 @@ pub enum ResponseMode {
     HybridAlias,
 }
 
+/// Broadcast mode for multi-record-type and multi-resolver transmission
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub enum BroadcastMode {
+    /// Send via all record types to all resolvers (maximum redundancy)
+    #[default]
+    #[serde(rename = "full")]
+    Full,
+    /// Rotate through record types (one type per fragment)
+    #[serde(rename = "rotate")]
+    Rotate,
+    /// Use only the first configured record type
+    #[serde(rename = "single")]
+    Single,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     /// Local UDP bind address
@@ -64,6 +79,43 @@ pub struct ClientConfig {
     /// Multiple sockets with random ports help avoid rate limiting
     #[serde(default)]
     pub query_socket_pool_size: Option<usize>,
+
+    // === Multi-Record Type Broadcast Options ===
+    
+    /// DNS record types to use for queries (default: ["TXT"])
+    /// Options: "TXT", "A", "AAAA", "CNAME", "MX", "NS", "NULL"
+    #[serde(default = "default_record_types")]
+    pub record_types: Vec<String>,
+    /// Broadcast mode: "full" (all types x all resolvers), "rotate", "single"
+    #[serde(default)]
+    pub broadcast_mode: BroadcastMode,
+
+    // === NACK-Based Retransmission Options ===
+    
+    /// Enable NACK-based selective retransmission (default: true)
+    #[serde(default = "default_true")]
+    pub enable_nack: bool,
+    /// NACK generation delay in milliseconds (default: 50ms)
+    #[serde(default = "default_nack_delay")]
+    pub nack_delay_ms: u64,
+    /// Minimum interval between NACKs for the same packet (default: 100ms)
+    #[serde(default = "default_nack_interval")]
+    pub nack_interval_ms: u64,
+
+    // === Source Port Rotation Options ===
+    
+    /// Interval in milliseconds to rotate source ports (0 = disabled)
+    #[serde(default)]
+    pub source_port_rotation_interval_ms: u64,
+
+    // === SOCKS5 Proxy Options (for bi-directional tunneling) ===
+    
+    /// SOCKS5 server bind address (client-side, for local apps)
+    #[serde(default)]
+    pub socks5_bind: Option<SocketAddr>,
+    /// Enable reverse SOCKS5 (server can initiate connections through client)
+    #[serde(default)]
+    pub enable_reverse_socks5: bool,
 }
 
 fn default_response_mode() -> ResponseMode {
@@ -74,12 +126,28 @@ fn default_uplink_mode() -> ResponseMode {
     ResponseMode::Dns
 }
 
+fn default_record_types() -> Vec<String> {
+    vec!["TXT".to_string()]
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_nack_delay() -> u64 {
+    50
+}
+
+fn default_nack_interval() -> u64 {
+    100
+}
+
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             local_udp: "127.0.0.1:5353".parse().unwrap(),
             response_udp_port: None,
-            server_udp_addr: None,  // Must be set when uplink_mode is "udp" or "hybrid"
+            server_udp_addr: None,
             uplink_mode: ResponseMode::Dns,
             response_mode: ResponseMode::Udp,
             domains: vec!["example.com".to_string()],
@@ -90,9 +158,21 @@ impl Default for ClientConfig {
             randomize_local_port: false,
             plain_mode: false,
             // Agility options
-            retry_timeout_ms: Some(100),  // Aggressive: 100ms timeout
-            max_retries: Some(10),         // Aggressive: 10 retries
-            query_socket_pool_size: Some(5), // 5 sockets in pool
+            retry_timeout_ms: Some(100),
+            max_retries: Some(10),
+            query_socket_pool_size: Some(5),
+            // Multi-record type broadcast
+            record_types: default_record_types(),
+            broadcast_mode: BroadcastMode::Full,
+            // NACK options
+            enable_nack: true,
+            nack_delay_ms: 50,
+            nack_interval_ms: 100,
+            // Port rotation
+            source_port_rotation_interval_ms: 0,
+            // SOCKS5
+            socks5_bind: None,
+            enable_reverse_socks5: false,
         }
     }
 }
@@ -122,21 +202,61 @@ pub struct ServerConfig {
     /// Plain mode: receive raw UDP packets directly (bypass DNS decoding) for debugging
     #[serde(default)]
     pub plain_mode: bool,
+
+    // === Multi-Record Type Broadcast Options ===
+    
+    /// DNS record types to use for responses (default: ["TXT"])
+    #[serde(default = "default_record_types")]
+    pub record_types: Vec<String>,
+    /// Broadcast mode for responses
+    #[serde(default)]
+    pub broadcast_mode: BroadcastMode,
+
+    // === NACK-Based Retransmission Options ===
+    
+    /// Enable NACK-based selective retransmission (default: true)
+    #[serde(default = "default_true")]
+    pub enable_nack: bool,
+    /// NACK generation delay in milliseconds (default: 50ms)
+    #[serde(default = "default_nack_delay")]
+    pub nack_delay_ms: u64,
+    /// Minimum interval between NACKs for the same packet (default: 100ms)
+    #[serde(default = "default_nack_interval")]
+    pub nack_interval_ms: u64,
+
+    // === SOCKS5 Proxy Options (for bi-directional tunneling) ===
+    
+    /// SOCKS5 server bind address (server-side, for remote apps)
+    #[serde(default)]
+    pub socks5_bind: Option<SocketAddr>,
+    /// Enable reverse SOCKS5 (allow connections to be initiated from server to client)
+    #[serde(default)]
+    pub enable_reverse_socks5: bool,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             dns_bind: "0.0.0.0:53".parse().unwrap(),
-            udp_query_port: Some(5354),  // Default port for UDP uplink queries
+            udp_query_port: Some(5354),
             target_udp: None,
-            client_udp_port: Some(5353),  // Default port for sending responses to client
+            client_udp_port: Some(5353),
             response_mode: ResponseMode::Udp,
             domains: vec!["example.com".to_string()],
             max_subdomain_length: 63,
             min_subdomain_length: 0,
             randomize_dns_port: false,
             plain_mode: false,
+            // Multi-record type broadcast
+            record_types: default_record_types(),
+            broadcast_mode: BroadcastMode::Full,
+            // NACK options
+            enable_nack: true,
+            nack_delay_ms: 50,
+            nack_interval_ms: 100,
+            // SOCKS5
+            socks5_bind: None,
+            enable_reverse_socks5: false,
         }
     }
 }

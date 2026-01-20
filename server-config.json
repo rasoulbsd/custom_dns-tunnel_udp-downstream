@@ -1,15 +1,17 @@
 {
-  "dns_bind": "0.0.0.0:53533",
+  "dns_bind": "0.0.0.0:53",
   "udp_query_port": 5354,
-  "target_udp": "127.0.0.1:8080",
+  "target_udp": "127.0.0.1:22",
   "client_udp_port": 5355,
-  "response_mode": "udp/dns",
-  "domains": [
-    "example.com",
-    "us.meonme.ir"
-  ],
-  "max_subdomain_length": 100,
-  "min_subdomain_length": 60,
-  "randomize_dns_port": false,
-  "plain_mode": false
+  "response_mode": "dns",
+  "domains": ["us.meonme.ir"],
+  "max_subdomain_length": 120,
+  "min_subdomain_length": 50,
+
+  "record_types": ["TXT", "A", "AAAA", "CNAME", "NS", "MX"],
+  "broadcast_mode": "full",
+  "enable_nack": true,
+  "nack_delay_ms": 50,
+  "nack_interval_ms": 100,
+  "socks5_bind": "127.0.0.1:1081"
 }
