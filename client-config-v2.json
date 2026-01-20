@@ -1,0 +1,65 @@
+{
+  "version": 2,
+  "local_bind": "0.0.0.0:5355",
+  
+  "profiles": {
+    "default": "interactive",
+    "interactive": {
+      "window_packets": 8,
+      "retransmit_ms": 100,
+      "max_retries": 5,
+      "max_payload_bytes": 200,
+      "fec_enabled": false,
+      "redundancy_factor": 2,
+      "load_balance_strategy": "least_latency",
+      "prefer_transports": ["doq", "doh", "dns_udp"],
+      "adaptive_window": true,
+      "adaptive_payload": true
+    },
+    "bulk": {
+      "window_packets": 64,
+      "retransmit_ms": 200,
+      "max_retries": 10,
+      "max_payload_bytes": 800,
+      "min_payload_bytes": 200,
+      "fec_enabled": true,
+      "fec_parity_ratio": 0.1,
+      "redundancy_factor": 1,
+      "load_balance_strategy": "bandwidth_first",
+      "prefer_transports": ["doq", "direct_udp", "doh"]
+    }
+  },
+  
+  "domains": ["tunnel.example.com"],
+  
+  "resolvers": {
+    "db_path": "./resolvers.redb",
+    "watch_file": "./resolvers.txt",
+    "initial": [
+      {"addr": "1.1.1.1:53", "transport": "dns_udp"},
+      {"addr": "8.8.8.8:53", "transport": "dns_udp"},
+      {"addr": "https://cloudflare-dns.com/dns-query", "transport": "doh"}
+    ]
+  },
+  
+  "path_manager": {
+    "health_probe_interval_ms": 5000,
+    "probe_timeout_ms": 2000,
+    "circuit_breaker_threshold": 5,
+    "circuit_breaker_reset_ms": 30000,
+    "min_healthy_resolvers": 2
+  },
+  
+  "server": {
+    "udp_addr": "your-server.example.com:5354",
+    "direct_udp_enabled": true
+  },
+  
+  "advanced": {
+    "max_label_length": 63,
+    "min_label_length": 32,
+    "encoding": "hex",
+    "compression": "none",
+    "debug": false
+  }
+}

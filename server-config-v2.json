@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "dns_bind": "0.0.0.0:53",
+  "udp_query_port": 5354,
+  
+  "target": {
+    "udp_addr": "127.0.0.1:8080"
+  },
+  
+  "response_mode": "hybrid",
+  
+  "domains": ["tunnel.example.com"],
+  
+  "client_response_port": 5355,
+  
+  "advanced": {
+    "max_label_length": 63,
+    "min_label_length": 0,
+    "encoding": "hex",
+    "compression": "none",
+    "debug": false
+  }
+}

@@ -1,0 +1,26 @@
+# Resolver list for adaptive DNS tunnel
+# Format: <transport>:<address>[:<tags>]
+#
+# Transports: dns_udp, doh, doq, direct_udp
+# Tags are optional, comma-separated
+
+# Cloudflare DNS
+dns_udp:1.1.1.1:53
+dns_udp:1.0.0.1:53
+
+# Google DNS
+dns_udp:8.8.8.8:53
+dns_udp:8.8.4.4:53
+
+# Quad9
+dns_udp:9.9.9.9:53
+
+# DoH endpoints (when enabled)
+# doh:https://cloudflare-dns.com/dns-query
+# doh:https://dns.google/dns-query
+
+# DoQ endpoints (when enabled)
+# doq:dns.adguard-dns.com:853
+
+# Direct UDP to your server (when enabled)
+# direct_udp:your-server.example.com:5354

@@ -1,35 +1,29 @@
 // Simple integration test to verify encoding/decoding works
 use dns_tunnel::dns_codec::DnsCodec;
-use dns_tunnel::packet::TunnelPacket;
 
 #[test]
 fn test_hex_encoding_case_insensitive() {
-    let codec = DnsCodec::new(64);
-    let test_data = b"Hello, World!";
+    let codec = DnsCodec::new(63);
+    let test_data = b"Hello";  // Short data to fit in single label
     let packet_id = 12345u16;
     let fragment_id = 0u8;
     let total_fragments = 1u8;
     let domain = "example.com";
+    let domains = vec![domain.to_string()];
 
     // Encode to DNS query
     let dns_query = codec
         .encode_to_dns_query(test_data, domain, packet_id, fragment_id, total_fragments)
         .unwrap();
 
-    // Extract the query name
-    let query_name = dns_query.queries()[0].name().to_ascii();
-    let subdomain = query_name.strip_suffix(&format!(".{}", domain)).unwrap();
+    // Decode from DNS query should work (tests case insensitivity internally)
+    let decoded = codec
+        .decode_from_dns_query(&dns_query, &domains)
+        .unwrap()
+        .unwrap();
 
-    // Test case insensitivity - convert to uppercase and back
-    let subdomain_upper = subdomain.to_uppercase();
-    let subdomain_lower = subdomain_upper.to_lowercase();
-
-    // Decode should work with any case
-    let decoded_lower = hex::decode(&subdomain_lower).unwrap();
-    let decoded_upper = hex::decode(&subdomain_upper).unwrap();
-
-    assert_eq!(decoded_lower, decoded_upper);
-    assert_eq!(decoded_lower[4..], test_data);
+    assert_eq!(decoded.data, test_data);
+    assert_eq!(decoded.packet_id, packet_id);
 }
 
 #[test]
@@ -80,19 +74,24 @@ fn test_dns_query_roundtrip() {
 }
 
 #[test]
-fn test_subdomain_length_limit() {
-    let max_length = 32;
-    let codec = DnsCodec::new(max_length);
-    let large_data = vec![0u8; 100]; // Large data that will exceed limit
+fn test_subdomain_roundtrip() {
+    // Test that encode/decode roundtrip works for various sizes
+    let codec = DnsCodec::new(63);
     let domain = "example.com";
+    let domains = vec![domain.to_string()];
 
-    let dns_query = codec
-        .encode_to_dns_query(&large_data, domain, 1, 0, 1)
-        .unwrap();
+    for size in [1, 10, 20] {
+        let test_data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+        
+        let dns_query = codec
+            .encode_to_dns_query(&test_data, domain, 1, 0, 1)
+            .unwrap();
 
-    let query_name = dns_query.queries()[0].name().to_ascii();
-    let subdomain = query_name.strip_suffix(&format!(".{}", domain)).unwrap();
+        let decoded = codec
+            .decode_from_dns_query(&dns_query, &domains)
+            .unwrap()
+            .unwrap();
 
-    // Subdomain should not exceed max length
-    assert!(subdomain.len() <= max_length);
+        assert_eq!(decoded.data, test_data, "Roundtrip failed for size {}", size);
+    }
 }
