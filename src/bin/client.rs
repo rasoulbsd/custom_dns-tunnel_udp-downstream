@@ -468,9 +468,9 @@ async fn main() -> Result<()> {
                             // Valid response - process it
                             info!("[UDP-RESPONSE] Received: packet_id={}, fragment={}/{}", 
                                packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
-                            let mut reass = reassembler.lock().await;
-                            if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
-                                // Find the original source
+                        let mut reass = reassembler.lock().await;
+                        if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
+                            // Find the original source
                                 if let Some(pending_pkt) = pending.remove(&packet.packet_id) {
                                     let original_source = pending_pkt.original_source;
                                     // Mark as processed BEFORE sending
@@ -479,10 +479,10 @@ async fn main() -> Result<()> {
                                         processed.insert(packet.packet_id);
                                         if processed.len() > 1000 { processed.clear(); }
                                     }
-                                    // Forward reassembled packet to original source
+                                // Forward reassembled packet to original source
                                     drop(pending); // Release lock before async operation
-                                    if let Err(e) = udp_socket.send_to(&reassembled_data, original_source).await {
-                                        error!("Failed to send reassembled packet: {}", e);
+                                if let Err(e) = udp_socket.send_to(&reassembled_data, original_source).await {
+                                    error!("Failed to send reassembled packet: {}", e);
                                     } else {
                                         info!("[UDP-RESPONSE] Sent reassembled packet {} ({} bytes) to {}", 
                                               packet.packet_id, reassembled_data.len(), original_source);
@@ -619,8 +619,8 @@ async fn main() -> Result<()> {
                             info!("[UDP-UPLINK] Fragmenting packet {} into {} fragments", packet_id, total_fragments);
                             
                             // Store pending request (no retry for UDP - it's fast)
-                            {
-                                let mut pending = pending_requests.lock().await;
+                    {
+                        let mut pending = pending_requests.lock().await;
                                 pending.insert(packet_id, PendingPacket {
                                     original_source: source,
                                     packet_id,
@@ -629,8 +629,8 @@ async fn main() -> Result<()> {
                                     last_sent: Instant::now(),
                                     retry_count: 0,
                                 });
-                            }
-                            
+                    }
+
                             for (fragment_id, fragment_data) in fragments.iter().enumerate() {
                                 let udp_packet = codec.encode_udp_packet(
                                     fragment_data,
@@ -650,33 +650,33 @@ async fn main() -> Result<()> {
                         }
                         ResponseMode::Dns => {
                             // DNS uplink: send as DNS queries - PARALLEL to all resolvers using socket pool
-                            let max_chunk = codec.max_payload_per_query();
-                            let fragments = fragment_packet(data, max_chunk);
-                            let total_fragments = fragments.len() as u8;
+                            let max_chunk = codec.max_payload_per_query_for_domain(&domain);
+                    let fragments = fragment_packet(data, max_chunk);
+                    let total_fragments = fragments.len() as u8;
                             let num_resolvers = config.resolvers.len();
-                            
+
                             info!("[DNS-UPLINK] Fragmenting packet {} into {} fragments x {} resolvers = {} sends (parallel, {} sockets)", 
                                   packet_id, total_fragments, num_resolvers, total_fragments as usize * num_resolvers, socket_pool_size);
                             
                             // Pre-encode all DNS queries and prepare for retry storage
                             let mut dns_packets: Vec<(u8, SocketAddr, Vec<u8>)> = Vec::new();
-                            for (fragment_id, fragment_data) in fragments.iter().enumerate() {
-                                match codec.encode_to_dns_query(
-                                    fragment_data,
+                    for (fragment_id, fragment_data) in fragments.iter().enumerate() {
+                        match codec.encode_to_dns_query(
+                            fragment_data,
                                     &domain,
-                                    packet_id,
-                                    fragment_id as u8,
-                                    total_fragments,
-                                ) {
-                                    Ok(dns_query) => {
-                                        let mut buf = Vec::new();
-                                        let mut encoder = BinEncoder::new(&mut buf);
-                                        if let Err(e) = dns_query.emit(&mut encoder) {
-                                            error!("Failed to encode DNS query: {}", e);
-                                            continue;
-                                        }
+                            packet_id,
+                            fragment_id as u8,
+                            total_fragments,
+                        ) {
+                            Ok(dns_query) => {
+                                let mut buf = Vec::new();
+                                let mut encoder = BinEncoder::new(&mut buf);
+                                if let Err(e) = dns_query.emit(&mut encoder) {
+                                    error!("Failed to encode DNS query: {}", e);
+                                    continue;
+                                }
                                         let query_bytes = encoder.into_bytes().to_vec();
-                                        
+                                    
                                         // Add task for each resolver (spam mode)
                                         for resolver in &config.resolvers {
                                             dns_packets.push((fragment_id as u8, *resolver, query_bytes.clone()));
@@ -765,12 +765,12 @@ async fn main() -> Result<()> {
                                         }
                                     }));
                                 }
-                            } else {
+                                        } else {
                                 warn!("[HYBRID-UPLINK] server_udp_addr not set, skipping UDP uplink");
                             }
                             
                             // DNS part (more reliable, slower) - prepare tasks
-                            let max_chunk_dns = codec.max_payload_per_query();
+                            let max_chunk_dns = codec.max_payload_per_query_for_domain(&domain);
                             let fragments_dns = fragment_packet(data, max_chunk_dns);
                             let total_fragments_dns = fragments_dns.len() as u8;
                             let dns_count = fragments_dns.len() * num_resolvers;

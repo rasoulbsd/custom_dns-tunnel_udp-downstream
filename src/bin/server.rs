@@ -461,7 +461,11 @@ async fn main() -> Result<()> {
                                     ResponseMode::Dns => {
                                         // DNS only mode - SPAM MODE: send for ALL domains in PARALLEL
                                         info!("[DNS-RESPONSE] Mode: DNS only (parallel spam: {} domains)", domains_for_response.len());
-                                        let max_chunk = codec.max_payload_per_query();
+                                        let max_chunk = domains_for_response
+                                            .iter()
+                                            .map(|d| codec.max_payload_per_query_for_domain(d))
+                                            .min()
+                                            .unwrap_or_else(|| codec.max_payload_per_query());
                                         let fragments = fragment_packet(data, max_chunk);
                                         let total_fragments = fragments.len() as u8;
                                         
@@ -537,7 +541,11 @@ async fn main() -> Result<()> {
                                         let fragments_udp = fragment_packet(data, max_chunk_udp);
                                         let total_fragments_udp = fragments_udp.len() as u8;
                                         
-                                        let max_chunk_dns = codec.max_payload_per_query();
+                                        let max_chunk_dns = domains_for_response
+                                            .iter()
+                                            .map(|d| codec.max_payload_per_query_for_domain(d))
+                                            .min()
+                                            .unwrap_or_else(|| codec.max_payload_per_query());
                                         let fragments_dns = fragment_packet(data, max_chunk_dns);
                                         let total_fragments_dns = fragments_dns.len() as u8;
                                         
