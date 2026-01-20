@@ -17,5 +17,8 @@
   "min_subdomain_length": 20,
   "rotate_resolvers": true,
   "randomize_local_port": false,
-  "plain_mode": false
+  "plain_mode": false,
+  "max_retries": 3,
+  "retry_timeout_ms": 500,
+  "parallel_sends": true
 }
