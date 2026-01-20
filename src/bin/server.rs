@@ -420,13 +420,13 @@ async fn main() -> Result<()> {
                                             
                                             // Prepare all UDP packets first
                                             let mut udp_packets: Vec<(u8, Vec<u8>)> = Vec::new();
-                                            for (fragment_id, fragment_data) in fragments.iter().enumerate() {
-                                                let udp_packet = codec.encode_udp_packet(
-                                                    fragment_data,
-                                                    response_packet_id,
-                                                    fragment_id as u8,
-                                                    total_fragments,
-                                                );
+                                for (fragment_id, fragment_data) in fragments.iter().enumerate() {
+                                    let udp_packet = codec.encode_udp_packet(
+                                        fragment_data,
+                                        response_packet_id,
+                                        fragment_id as u8,
+                                        total_fragments,
+                                    );
                                                 udp_packets.push((fragment_id as u8, udp_packet));
                                             }
                                             
@@ -627,7 +627,7 @@ async fn main() -> Result<()> {
                                                         }
                                                     }
                                                 }
-                                            } else {
+                                    } else {
                                                 debug!("[HYBRID-RESPONSE] Skipping DNS for packet_id {}: query_id=0", response_packet_id);
                                             }
                                         }

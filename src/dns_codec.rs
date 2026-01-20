@@ -69,6 +69,8 @@ impl DnsCodec {
     }
 
     /// Encode UDP packet data into DNS query
+    /// Format: <random_prefix>.<payload_hex>.<domain>
+    /// Random prefix bypasses DNS caching and rate limiting
     pub fn encode_to_dns_query(
         &self,
         data: &[u8],
@@ -103,6 +105,10 @@ impl DnsCodec {
             &encoded
         };
 
+        // Generate random 6-char hex prefix (3 bytes) to bypass DNS caching
+        let random_bytes: [u8; 3] = rand::thread_rng().gen();
+        let random_prefix = hex::encode(random_bytes);
+
         // Create DNS query
         let mut message = Message::new();
         message.set_id(rand::thread_rng().gen());
@@ -110,8 +116,8 @@ impl DnsCodec {
         message.set_op_code(OpCode::Query);
         message.set_recursion_desired(true);
 
-        // Build query name: <subdomain>.<domain>
-        let query_name = format!("{}.{}", subdomain, domain);
+        // Build query name: <random_prefix>.<subdomain>.<domain>
+        let query_name = format!("{}.{}.{}", random_prefix, subdomain, domain);
         let name = Name::from_ascii(&query_name)
             .map_err(|e| anyhow!("Failed to create DNS name: {}", e))?;
 
@@ -123,6 +129,8 @@ impl DnsCodec {
     }
 
     /// Decode DNS query to extract UDP packet data
+    /// Handles format: <random_prefix>.<payload_hex>.<domain>
+    /// The random prefix is stripped before decoding
     pub fn decode_from_dns_query(&self, message: &Message, expected_domains: &[String]) -> Result<Option<TunnelPacket>> {
         if message.queries().is_empty() {
             return Ok(None);
@@ -160,27 +168,13 @@ impl DnsCodec {
             .ok_or_else(|| anyhow!("Domain not found"))?;
         
         // Extract subdomain part - remove the domain suffix
-        let subdomain_part = if query_name == domain.as_str() {
+        let full_subdomain = if query_name == domain.as_str() {
             // No subdomain, just the domain
             return Err(anyhow!("Query has no subdomain"));
         } else {
             // Remove .domain suffix (with dot) - this is the most common case
             if let Some(stripped) = query_name.strip_suffix(&format!(".{}", domain)) {
-                // Check if there are any remaining dots (shouldn't be, subdomain should be pure hex)
-                if stripped.contains('.') {
-                    // If there are dots, we might have matched the wrong domain
-                    // Try to extract by finding the last dot before the domain
-                    // For "subdomain.tunnel.example.com" with domain "tunnel.example.com"
-                    // We want "subdomain", not "subdomain.tunnel"
-                    if let Some(last_dot) = stripped.rfind('.') {
-                        // Take everything after the last dot as the actual subdomain
-                        &stripped[last_dot + 1..]
-                    } else {
-                        stripped
-                    }
-                } else {
-                    stripped
-                }
+                stripped
             } else if query_name.ends_with(domain) {
                 // Handle case where domain doesn't have leading dot in query (unlikely but possible)
                 let potential = &query_name[..query_name.len() - domain.len()];
@@ -189,6 +183,33 @@ impl DnsCodec {
             } else {
                 return Err(anyhow!("Invalid query format: cannot extract subdomain from '{}' with domain '{}'", query_name, domain));
             }
+        };
+        
+        // Handle random prefix format: <random_prefix>.<payload_hex>
+        // The random prefix is 6 hex chars, so we look for a dot after the first label
+        let subdomain_part = if let Some(dot_pos) = full_subdomain.find('.') {
+            // Check if first part looks like a random prefix (6 hex chars)
+            let first_part = &full_subdomain[..dot_pos];
+            if first_part.len() == 6 && first_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                // Strip the random prefix, take everything after the dot
+                let after_prefix = &full_subdomain[dot_pos + 1..];
+                // If there are more dots, take only the last part (the actual payload)
+                if let Some(last_dot) = after_prefix.rfind('.') {
+                    &after_prefix[last_dot + 1..]
+                } else {
+                    after_prefix
+                }
+            } else {
+                // Not a random prefix format, use old logic
+                if let Some(last_dot) = full_subdomain.rfind('.') {
+                    &full_subdomain[last_dot + 1..]
+                } else {
+                    full_subdomain
+                }
+            }
+        } else {
+            // No dots, use as-is (old format without random prefix)
+            full_subdomain
         };
         
         // Final validation: subdomain should be pure hex (no dots, no other chars)
@@ -254,6 +275,8 @@ impl DnsCodec {
     }
 
     /// Encode UDP packet data into DNS response
+    /// Format: <random_prefix>.<payload_hex>.<domain>
+    /// Random prefix ensures uniqueness for each response
     pub fn encode_to_dns_response(
         &self,
         data: &[u8],
@@ -282,6 +305,10 @@ impl DnsCodec {
             &encoded
         };
 
+        // Generate random 6-char hex prefix (3 bytes) to ensure uniqueness
+        let random_bytes: [u8; 3] = rand::thread_rng().gen();
+        let random_prefix = hex::encode(random_bytes);
+
         // Create DNS response
         let mut message = Message::new();
         message.set_id(query_id);
@@ -289,8 +316,8 @@ impl DnsCodec {
         message.set_op_code(OpCode::Query);
         message.set_recursion_desired(true);
 
-        // Build response name: <subdomain>.<domain>
-        let response_name = format!("{}.{}", subdomain, domain);
+        // Build response name: <random_prefix>.<subdomain>.<domain>
+        let response_name = format!("{}.{}.{}", random_prefix, subdomain, domain);
         let name = Name::from_ascii(&response_name)
             .map_err(|e| anyhow!("Failed to create DNS name: {}", e))?;
 
@@ -360,16 +387,43 @@ impl DnsCodec {
                         .max_by_key(|d| d.len())
                         .ok_or_else(|| anyhow!("Domain not found"))?;
                     
-                    let subdomain_part = if name_str == domain.as_str() {
+                    let full_subdomain = if name_str == domain.as_str() {
                         return Err(anyhow!("Response has no subdomain"));
                     } else {
                         if let Some(stripped) = name_str.strip_suffix(&format!(".{}", domain)) {
                             stripped
                         } else if name_str.ends_with(domain) {
-                            &name_str[..name_str.len() - domain.len()].trim_start_matches('.')
+                            name_str[..name_str.len() - domain.len()].trim_start_matches('.')
                         } else {
                             return Err(anyhow!("Invalid response format"));
                         }
+                    };
+                    
+                    // Handle random prefix format: <random_prefix>.<payload_hex>
+                    // The random prefix is 6 hex chars, so we look for a dot after the first label
+                    let subdomain_part = if let Some(dot_pos) = full_subdomain.find('.') {
+                        // Check if first part looks like a random prefix (6 hex chars)
+                        let first_part = &full_subdomain[..dot_pos];
+                        if first_part.len() == 6 && first_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                            // Strip the random prefix, take everything after the dot
+                            let after_prefix = &full_subdomain[dot_pos + 1..];
+                            // If there are more dots, take only the last part (the actual payload)
+                            if let Some(last_dot) = after_prefix.rfind('.') {
+                                &after_prefix[last_dot + 1..]
+                            } else {
+                                after_prefix
+                            }
+                        } else {
+                            // Not a random prefix format, use old logic
+                            if let Some(last_dot) = full_subdomain.rfind('.') {
+                                &full_subdomain[last_dot + 1..]
+                            } else {
+                                full_subdomain
+                            }
+                        }
+                    } else {
+                        // No dots, use as-is (old format without random prefix)
+                        full_subdomain
                     };
                     
                     // Decode the subdomain

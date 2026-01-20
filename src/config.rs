@@ -51,6 +51,19 @@ pub struct ClientConfig {
     /// Plain mode: send raw UDP packets directly (bypass DNS encoding) for debugging
     #[serde(default)]
     pub plain_mode: bool,
+    
+    // === Agility / Performance Options ===
+    
+    /// Retry timeout in milliseconds (default: 100ms for aggressive retry)
+    #[serde(default)]
+    pub retry_timeout_ms: Option<u32>,
+    /// Maximum retry attempts (default: 10 for aggressive retry)
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    /// Number of UDP sockets in the query pool (default: 5)
+    /// Multiple sockets with random ports help avoid rate limiting
+    #[serde(default)]
+    pub query_socket_pool_size: Option<usize>,
 }
 
 fn default_response_mode() -> ResponseMode {
@@ -76,6 +89,10 @@ impl Default for ClientConfig {
             rotate_resolvers: true,
             randomize_local_port: false,
             plain_mode: false,
+            // Agility options
+            retry_timeout_ms: Some(100),  // Aggressive: 100ms timeout
+            max_retries: Some(10),         // Aggressive: 10 retries
+            query_socket_pool_size: Some(5), // 5 sockets in pool
         }
     }
 }

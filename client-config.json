@@ -13,12 +13,12 @@
     "217.218.26.77:53",
     "217.218.26.78:53"
   ],
-  "max_subdomain_length": 100,
+  "max_subdomain_length": 63,
   "min_subdomain_length": 20,
   "rotate_resolvers": true,
   "randomize_local_port": false,
   "plain_mode": false,
-  "max_retries": 3,
-  "retry_timeout_ms": 500,
-  "parallel_sends": true
+  "retry_timeout_ms": 100,
+  "max_retries": 10,
+  "query_socket_pool_size": 5
 }

@@ -18,7 +18,64 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
+
+/// Pending packet info for retry mechanism
+#[derive(Clone)]
+struct PendingPacket {
+    /// Original source address (where to send response back)
+    original_source: SocketAddr,
+    /// Packet ID for tracking
+    packet_id: u16,
+    /// Pre-encoded fragments ready to resend (fragment_id, resolver, bytes)
+    encoded_fragments: Vec<(u8, SocketAddr, Vec<u8>)>,
+    /// When the packet was first sent
+    first_sent: Instant,
+    /// When the packet was last sent (for timeout calculation)
+    last_sent: Instant,
+    /// Number of retry attempts made
+    retry_count: u32,
+}
+
+/// Pool of UDP sockets with random ports for sending queries
+struct SocketPool {
+    sockets: Vec<Arc<UdpSocket>>,
+    next_index: std::sync::atomic::AtomicUsize,
+}
+
+impl SocketPool {
+    async fn new(pool_size: usize) -> Result<Self> {
+        let mut sockets = Vec::with_capacity(pool_size);
+        for i in 0..pool_size {
+            let socket = UdpSocket::bind("0.0.0.0:0")
+                .await
+                .with_context(|| format!("Failed to bind socket {} in pool", i))?;
+            let local_addr = socket.local_addr()?;
+            info!("[SOCKET-POOL] Created socket {}: {}", i, local_addr);
+            sockets.push(Arc::new(socket));
+        }
+        Ok(Self {
+            sockets,
+            next_index: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+    
+    /// Get the next socket in round-robin fashion
+    fn next(&self) -> Arc<UdpSocket> {
+        let idx = self.next_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.sockets.len();
+        Arc::clone(&self.sockets[idx])
+    }
+    
+    /// Get all sockets for listening
+    fn all(&self) -> &[Arc<UdpSocket>] {
+        &self.sockets
+    }
+    
+    /// Get a specific socket by index
+    fn get(&self, idx: usize) -> Arc<UdpSocket> {
+        Arc::clone(&self.sockets[idx % self.sockets.len()])
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "dns-tunnel-client")]
@@ -141,197 +198,197 @@ async fn main() -> Result<()> {
         .context("Failed to bind local UDP socket")?);
     info!("Bound to local UDP: {}", local_udp);
     
-    // Create socket for DNS queries
-    // CRITICAL: DNS responses come back to the SAME port we send queries from (via resolver),
-    // so we must use dns_query_socket for both sending queries AND receiving responses
-    let dns_query_socket = Arc::new(UdpSocket::bind("0.0.0.0:0")
-        .await
-        .context("Failed to bind DNS query socket")?);
+    // Create socket pool for DNS queries (multiple sockets with random ports)
+    // This helps avoid rate limiting and improves performance
+    let socket_pool_size = config.query_socket_pool_size.unwrap_or(5);
+    let socket_pool = Arc::new(SocketPool::new(socket_pool_size).await?);
+    info!("[SOCKET-POOL] Created {} sockets for DNS queries", socket_pool_size);
     
-    // For DNS/hybrid mode, we receive responses on dns_query_socket (same socket we send from)
-    // This is because DNS responses come back through the resolver to our query source port
-    let dns_response_socket = if matches!(config.response_mode, ResponseMode::Dns | ResponseMode::Hybrid | ResponseMode::HybridAlias) {
-        Some(dns_query_socket.clone()) // Use the same socket for receiving responses
-    } else {
-        None
-    };
+    // Keep a reference to the first socket for compatibility (used for some response handling)
+    let dns_query_socket = socket_pool.get(0);
 
     let codec = Arc::new(DnsCodec::new_with_min(config.max_subdomain_length, config.min_subdomain_length));
     let reassembler = Arc::new(Mutex::new(PacketReassembler::new()));
-    let pending_requests: Arc<Mutex<HashMap<u16, (SocketAddr, u16)>>> = Arc::new(Mutex::new(HashMap::new()));
+    let pending_requests: Arc<Mutex<HashMap<u16, PendingPacket>>> = Arc::new(Mutex::new(HashMap::new()));
     let resolver_index = Arc::new(Mutex::new(0usize));
+    
+    // Retry configuration
+    let retry_timeout_ms = config.retry_timeout_ms.unwrap_or(100);
+    let max_retries = config.max_retries.unwrap_or(10);
+    info!("[RETRY] Timeout: {}ms, Max retries: {}", retry_timeout_ms, max_retries);
     
     // Deduplication: track packet_ids that have been successfully reassembled
     // This prevents processing duplicate responses when using hybrid mode
     use std::collections::HashSet;
     let processed_response_ids: Arc<Mutex<HashSet<u16>>> = Arc::new(Mutex::new(HashSet::new()));
 
-    // Spawn task to receive DNS responses on the query socket (if DNS or hybrid mode)
-    // CRITICAL: We MUST receive responses on the SAME socket we send queries from,
-    // because the server replies to the query source port. Using a separate socket
-    // causes port mismatch (server sends to query port, but we listen on response port).
+    // Spawn tasks to receive DNS responses on ALL sockets in the pool (if DNS or hybrid mode)
+    // CRITICAL: We MUST receive responses on the SAME sockets we send queries from,
+    // because the server replies to the query source port.
     if matches!(config.response_mode, ResponseMode::Dns | ResponseMode::Hybrid | ResponseMode::HybridAlias) {
-        let dns_query_sock_for_response = dns_query_socket.clone();
-        let codec_dns = codec.clone();
-        let reassembler_dns = reassembler.clone();
-        let pending_requests_dns = pending_requests.clone();
-        let processed_response_ids_dns = processed_response_ids.clone();
-        let udp_socket_dns = udp_socket.clone();
-        let domains = config.domains.clone();
-        
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            let query_socket_addr = dns_query_sock_for_response.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-            info!("[DNS-RESPONSE] Listening for responses on query socket: {}", query_socket_addr);
-            loop {
-                match dns_query_sock_for_response.recv_from(&mut buf).await {
-                    Ok((len, dns_source)) => {
-                        let response_data = &buf[..len];
-                        info!("[DNS-RESPONSE] Received {} bytes from {} on query socket", len, dns_source);
-                    
-                        match Message::from_bytes(response_data) {
-                            Ok(message) => {
-                                match codec_dns.decode_from_dns_response(&message, &domains) {
-                                    Ok(Some(packet)) => {
-                                        // Deduplication: skip if already processed
-                                        {
-                                            let processed = processed_response_ids_dns.lock().await;
-                                            if processed.contains(&packet.packet_id) {
-                                                debug!("[DNS-RESPONSE] Skipping packet_id {} (already processed)", packet.packet_id);
-                                                continue;
-                                            }
-                                        }
-                                        
-                                        info!("[DNS-RESPONSE] Decoded: packet_id={}, fragment={}/{}", 
-                                               packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
-                                        
-                                        let mut reass = reassembler_dns.lock().await;
-                                        if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
-                                            // Find the original source
-                                            let mut pending = pending_requests_dns.lock().await;
-                                            if let Some((original_source, _)) = pending.remove(&packet.packet_id) {
-                                                // Mark as processed
-                                                {
-                                                    let mut processed = processed_response_ids_dns.lock().await;
-                                                    processed.insert(packet.packet_id);
-                                                    if processed.len() > 1000 { processed.clear(); }
+        // Spawn a listener for each socket in the pool
+        for socket_idx in 0..socket_pool_size {
+            let socket = socket_pool.get(socket_idx);
+            let codec_dns = codec.clone();
+            let reassembler_dns = reassembler.clone();
+            let pending_requests_dns = pending_requests.clone();
+            let processed_response_ids_dns = processed_response_ids.clone();
+            let udp_socket_dns = udp_socket.clone();
+            let domains = config.domains.clone();
+            
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65535];
+                let socket_addr = socket.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+                info!("[DNS-RESPONSE] Listening on socket {}: {}", socket_idx, socket_addr);
+                loop {
+                    match socket.recv_from(&mut buf).await {
+                        Ok((len, dns_source)) => {
+                            let response_data = &buf[..len];
+                            debug!("[DNS-RESPONSE] Received {} bytes from {} on socket {}", len, dns_source, socket_idx);
+                        
+                            match Message::from_bytes(response_data) {
+                                Ok(message) => {
+                                    match codec_dns.decode_from_dns_response(&message, &domains) {
+                                        Ok(Some(packet)) => {
+                                            // Deduplication: skip if already processed
+                                            {
+                                                let processed = processed_response_ids_dns.lock().await;
+                                                if processed.contains(&packet.packet_id) {
+                                                    debug!("[DNS-RESPONSE] Skipping packet_id {} (already processed)", packet.packet_id);
+                                                    continue;
                                                 }
-                                                // Forward reassembled packet to original source
-                                                if let Err(e) = udp_socket_dns.send_to(&reassembled_data, original_source).await {
-                                                    error!("Failed to send reassembled packet: {}", e);
+                                            }
+                                            
+                                            info!("[DNS-RESPONSE] Decoded: packet_id={}, fragment={}/{}", 
+                                                   packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
+                                            
+                                            let mut reass = reassembler_dns.lock().await;
+                                            if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
+                                                // Find the original source
+                                                let mut pending = pending_requests_dns.lock().await;
+                                                if let Some(pending_pkt) = pending.remove(&packet.packet_id) {
+                                                    // Mark as processed
+                                                    {
+                                                        let mut processed = processed_response_ids_dns.lock().await;
+                                                        processed.insert(packet.packet_id);
+                                                        if processed.len() > 1000 { processed.clear(); }
+                                                    }
+                                                    // Forward reassembled packet to original source
+                                                    if let Err(e) = udp_socket_dns.send_to(&reassembled_data, pending_pkt.original_source).await {
+                                                        error!("Failed to send reassembled packet: {}", e);
+                                                    } else {
+                                                        info!("[DNS-RESPONSE] Sent reassembled packet {} ({} bytes) to {}", 
+                                                              packet.packet_id, reassembled_data.len(), pending_pkt.original_source);
+                                                    }
                                                 } else {
-                                                    info!("[DNS-RESPONSE] Sent reassembled packet {} ({} bytes) to {}", 
-                                                          packet.packet_id, reassembled_data.len(), original_source);
+                                                    debug!("[DNS-RESPONSE] No pending request for packet_id {} (likely already handled)", packet.packet_id);
                                                 }
-                                            } else {
-                                                debug!("[DNS-RESPONSE] No pending request for packet_id {} (likely already handled by UDP)", packet.packet_id);
                                             }
                                         }
-                                    }
-                                    Ok(None) => {
-                                        // Not a tunnel DNS response, ignore
-                                        debug!("[DNS-RESPONSE] Does not match tunnel format");
-                                    }
-                                    Err(e) => {
-                                        debug!("[DNS-RESPONSE] Failed to decode: {}", e);
+                                        Ok(None) => {
+                                            // Not a tunnel DNS response, ignore
+                                        }
+                                        Err(e) => {
+                                            debug!("[DNS-RESPONSE] Failed to decode: {}", e);
+                                        }
                                     }
                                 }
+                                Err(e) => {
+                                    debug!("[DNS-RESPONSE] Failed to parse: {}", e);
+                                }
                             }
-                            Err(e) => {
-                                debug!("[DNS-RESPONSE] Failed to parse: {}", e);
+                        }
+                        Err(e) => {
+                            error!("[DNS-RESPONSE] Error receiving on socket {}: {}", socket_idx, e);
+                            sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+            });
+        }
+    }
+    
+    // Spawn background task for aggressive retry mechanism
+    {
+        let pending_requests_retry = pending_requests.clone();
+        let socket_pool_retry = socket_pool.clone();
+        let processed_response_ids_retry = processed_response_ids.clone();
+        let retry_timeout = Duration::from_millis(retry_timeout_ms as u64);
+        let check_interval = Duration::from_millis(50); // Check every 50ms for timed out packets
+        
+        tokio::spawn(async move {
+            info!("[RETRY] Background task started (check interval: 50ms, timeout: {}ms, max: {})", 
+                  retry_timeout_ms, max_retries);
+            loop {
+                sleep(check_interval).await;
+                
+                let now = Instant::now();
+                let mut packets_to_retry: Vec<(u16, PendingPacket)> = Vec::new();
+                let mut packets_to_remove: Vec<u16> = Vec::new();
+                
+                // Find timed-out packets
+                {
+                    let mut pending = pending_requests_retry.lock().await;
+                    for (packet_id, pkt) in pending.iter_mut() {
+                        // Skip if already processed
+                        {
+                            let processed = processed_response_ids_retry.lock().await;
+                            if processed.contains(packet_id) {
+                                packets_to_remove.push(*packet_id);
+                                continue;
+                            }
+                        }
+                        
+                        // Check if timed out
+                        if now.duration_since(pkt.last_sent) >= retry_timeout {
+                            if pkt.retry_count >= max_retries {
+                                warn!("[RETRY] Packet {} exceeded max retries ({}), giving up", packet_id, max_retries);
+                                packets_to_remove.push(*packet_id);
+                            } else {
+                                // Mark for retry
+                                pkt.retry_count += 1;
+                                pkt.last_sent = now;
+                                packets_to_retry.push((*packet_id, pkt.clone()));
                             }
                         }
                     }
-                    Err(e) => {
-                        error!("[DNS-RESPONSE] Error receiving on query socket: {}", e);
-                        sleep(Duration::from_millis(100)).await;
+                    
+                    // Remove expired packets
+                    for id in &packets_to_remove {
+                        pending.remove(id);
                     }
+                }
+                
+                // Retry sending timed-out packets
+                for (packet_id, pkt) in packets_to_retry {
+                    debug!("[RETRY] Retrying packet {} (attempt {}/{})", packet_id, pkt.retry_count, max_retries);
+                    
+                    // Send all fragments in parallel using different sockets
+                    let send_tasks: Vec<_> = pkt.encoded_fragments.iter().enumerate().map(|(i, (frag_id, resolver, bytes))| {
+                        let socket = socket_pool_retry.get(i);
+                        let resolver = *resolver;
+                        let bytes = bytes.clone();
+                        let frag_id = *frag_id;
+                        tokio::spawn(async move {
+                            match socket.send_to(&bytes, resolver).await {
+                                Ok(_) => Ok(()),
+                                Err(e) => {
+                                    debug!("[RETRY] Failed to resend fragment {} to {}: {}", frag_id, resolver, e);
+                                    Err(e)
+                                }
+                            }
+                        })
+                    }).collect();
+                    
+                    let results = join_all(send_tasks).await;
+                    let success = results.iter().filter(|r| r.is_ok() && r.as_ref().unwrap().is_ok()).count();
+                    debug!("[RETRY] Packet {} retry: {}/{} fragments sent", packet_id, success, pkt.encoded_fragments.len());
                 }
             }
         });
     }
     
-    // Also spawn task on separate dns_response_socket if it exists (for backward compatibility)
-    // But responses should primarily come through dns_query_socket
-    if let Some(dns_response_sock) = dns_response_socket {
-        let codec_dns = codec.clone();
-        let reassembler_dns = reassembler.clone();
-        let pending_requests_dns = pending_requests.clone();
-        let processed_response_ids_dns = processed_response_ids.clone();
-        let udp_socket_dns = udp_socket.clone();
-        let domains = config.domains.clone();
-        
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 65535];
-            let response_socket_addr = dns_response_sock.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
-            warn!("[DNS-RESPONSE] Also listening on separate response socket: {} (responses should come through query socket)", response_socket_addr);
-            loop {
-                match dns_response_sock.recv_from(&mut buf).await {
-                    Ok((len, dns_source)) => {
-                        let response_data = &buf[..len];
-                        info!("[DNS-RESPONSE] Received {} bytes from {} on separate response socket", len, dns_source);
-                    
-                        match Message::from_bytes(response_data) {
-                        Ok(message) => {
-                            match codec_dns.decode_from_dns_response(&message, &domains) {
-                                Ok(Some(packet)) => {
-                                    // Deduplication: skip if already processed
-                                    {
-                                        let processed = processed_response_ids_dns.lock().await;
-                                        if processed.contains(&packet.packet_id) {
-                                            debug!("[DNS-RESPONSE] Skipping packet_id {} (already processed)", packet.packet_id);
-                                            continue;
-                                        }
-                                    }
-                                    
-                                    info!("[DNS-RESPONSE] Decoded: packet_id={}, fragment={}/{}", 
-                                           packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
-                                    
-                                    let mut reass = reassembler_dns.lock().await;
-                                    if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
-                                        // Find the original source
-                                        let mut pending = pending_requests_dns.lock().await;
-                                        if let Some((original_source, _)) = pending.remove(&packet.packet_id) {
-                                            // Mark as processed
-                                            {
-                                                let mut processed = processed_response_ids_dns.lock().await;
-                                                processed.insert(packet.packet_id);
-                                                if processed.len() > 1000 { processed.clear(); }
-                                            }
-                                            // Forward reassembled packet to original source
-                                            if let Err(e) = udp_socket_dns.send_to(&reassembled_data, original_source).await {
-                                                error!("Failed to send reassembled packet: {}", e);
-                                            } else {
-                                                info!("[DNS-RESPONSE] Sent reassembled packet {} ({} bytes) to {}", 
-                                                      packet.packet_id, reassembled_data.len(), original_source);
-                                            }
-                                        } else {
-                                            debug!("[DNS-RESPONSE] No pending request for packet_id {} (likely already handled by UDP)", packet.packet_id);
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    // Not a tunnel DNS response, ignore
-                                    debug!("[DNS-RESPONSE] Does not match tunnel format");
-                                }
-                                Err(e) => {
-                                    debug!("[DNS-RESPONSE] Failed to decode: {}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            debug!("[DNS-RESPONSE] Failed to parse: {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("[DNS-RESPONSE] Error receiving: {}", e);
-                    sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-        });
-    }
+    // Note: dns_response_socket is now handled by the socket pool listeners above
 
     // Main loop: receive packets and handle both local UDP and DNS responses
     let mut buf = vec![0u8; 65535];
@@ -350,11 +407,11 @@ async fn main() -> Result<()> {
                     // In plain mode, forward directly to original source
                     let mut pending = pending_requests.lock().await;
                     // Use packet_id 0 for plain mode matching
-                    if let Some((original_source, _)) = pending.remove(&0) {
-                        if let Err(e) = udp_socket.send_to(data, original_source).await {
-                            error!("[PLAIN-MODE] Failed to forward to {}: {}", original_source, e);
+                    if let Some(pending_pkt) = pending.remove(&0) {
+                        if let Err(e) = udp_socket.send_to(data, pending_pkt.original_source).await {
+                            error!("[PLAIN-MODE] Failed to forward to {}: {}", pending_pkt.original_source, e);
                         } else {
-                            info!("[PLAIN-MODE] Forwarded {} bytes to {}", len, original_source);
+                            info!("[PLAIN-MODE] Forwarded {} bytes to {}", len, pending_pkt.original_source);
                         }
                     } else {
                         debug!("[PLAIN-MODE] No pending request for packet_id 0, treating as local UDP");
@@ -411,25 +468,21 @@ async fn main() -> Result<()> {
                             // Valid response - process it
                             info!("[UDP-RESPONSE] Received: packet_id={}, fragment={}/{}", 
                                packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
-                        let mut reass = reassembler.lock().await;
-                        if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
-                            // Find the original source
-                            if let Some((original_source, _)) = pending.remove(&packet.packet_id) {
+                            let mut reass = reassembler.lock().await;
+                            if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
+                                // Find the original source
+                                if let Some(pending_pkt) = pending.remove(&packet.packet_id) {
+                                    let original_source = pending_pkt.original_source;
                                     // Mark as processed BEFORE sending
                                     {
                                         let mut processed = processed_response_ids.lock().await;
                                         processed.insert(packet.packet_id);
-                                        // #region agent log
-                                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/.cursor/debug.log") {
-                                            let _ = writeln!(f, r#"{{"hypothesisId":"DEDUP","location":"client.rs:udp_mark","message":"marked_processed","data":{{"packet_id":{},"set_size":{}}},"timestamp":{}}}"#, packet.packet_id, processed.len(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-                                        }
-                                        // #endregion
                                         if processed.len() > 1000 { processed.clear(); }
                                     }
-                                // Forward reassembled packet to original source
+                                    // Forward reassembled packet to original source
                                     drop(pending); // Release lock before async operation
-                                if let Err(e) = udp_socket.send_to(&reassembled_data, original_source).await {
-                                    error!("Failed to send reassembled packet: {}", e);
+                                    if let Err(e) = udp_socket.send_to(&reassembled_data, original_source).await {
+                                        error!("Failed to send reassembled packet: {}", e);
                                     } else {
                                         info!("[UDP-RESPONSE] Sent reassembled packet {} ({} bytes) to {}", 
                                               packet.packet_id, reassembled_data.len(), original_source);
@@ -487,7 +540,8 @@ async fn main() -> Result<()> {
                             let mut reass = reassembler.lock().await;
                             if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
                                 let mut pending = pending_requests.lock().await;
-                                if let Some((original_source, _)) = pending.remove(&packet.packet_id) {
+                                if let Some(pending_pkt) = pending.remove(&packet.packet_id) {
+                                    let original_source = pending_pkt.original_source;
                                     // Mark as processed
                                     {
                                         let mut processed = processed_response_ids.lock().await;
@@ -543,22 +597,8 @@ async fn main() -> Result<()> {
                     let packet_id = packet_id_counter;
                     packet_id_counter = packet_id_counter.wrapping_add(1);
 
-                    // Store pending request
-                    {
-                        let mut pending = pending_requests.lock().await;
-                        pending.insert(packet_id, (source, 0));
-                    }
-
                     // Select domain for DNS queries
-                    let domain = &config.domains[rand::thread_rng().gen_range(0..config.domains.len())];
-                    // Note: resolver selection is computed but we send to all resolvers (spam mode)
-                    let _resolver = if config.rotate_resolvers {
-                        let mut idx = resolver_index.lock().await;
-                        *idx = (*idx + 1) % config.resolvers.len();
-                        rotate_resolver(&config.resolvers, *idx)
-                    } else {
-                        &config.resolvers[rand::thread_rng().gen_range(0..config.resolvers.len())]
-                    };
+                    let domain = config.domains[rand::thread_rng().gen_range(0..config.domains.len())].clone();
 
                     // Send based on uplink_mode
                     match config.uplink_mode {
@@ -578,6 +618,19 @@ async fn main() -> Result<()> {
                             
                             info!("[UDP-UPLINK] Fragmenting packet {} into {} fragments", packet_id, total_fragments);
                             
+                            // Store pending request (no retry for UDP - it's fast)
+                            {
+                                let mut pending = pending_requests.lock().await;
+                                pending.insert(packet_id, PendingPacket {
+                                    original_source: source,
+                                    packet_id,
+                                    encoded_fragments: Vec::new(), // UDP doesn't need retry
+                                    first_sent: Instant::now(),
+                                    last_sent: Instant::now(),
+                                    retry_count: 0,
+                                });
+                            }
+                            
                             for (fragment_id, fragment_data) in fragments.iter().enumerate() {
                                 let udp_packet = codec.encode_udp_packet(
                                     fragment_data,
@@ -586,7 +639,8 @@ async fn main() -> Result<()> {
                                     total_fragments,
                                 );
                                 
-                                if let Err(e) = dns_query_socket.send_to(&udp_packet, server_udp).await {
+                                let socket = socket_pool.next();
+                                if let Err(e) = socket.send_to(&udp_packet, server_udp).await {
                                     warn!("[UDP-UPLINK] Failed to send to {}: {}", server_udp, e);
                                 } else {
                                     info!("[UDP-UPLINK] Sent fragment {}/{} ({} bytes) to {}", 
@@ -595,21 +649,21 @@ async fn main() -> Result<()> {
                             }
                         }
                         ResponseMode::Dns => {
-                            // DNS uplink: send as DNS queries - PARALLEL to all resolvers
+                            // DNS uplink: send as DNS queries - PARALLEL to all resolvers using socket pool
                             let max_chunk = codec.max_payload_per_query();
                             let fragments = fragment_packet(data, max_chunk);
                             let total_fragments = fragments.len() as u8;
                             let num_resolvers = config.resolvers.len();
                             
-                            info!("[DNS-UPLINK] Fragmenting packet {} into {} fragments x {} resolvers = {} sends (parallel)", 
-                                  packet_id, total_fragments, num_resolvers, total_fragments as usize * num_resolvers);
+                            info!("[DNS-UPLINK] Fragmenting packet {} into {} fragments x {} resolvers = {} sends (parallel, {} sockets)", 
+                                  packet_id, total_fragments, num_resolvers, total_fragments as usize * num_resolvers, socket_pool_size);
                             
-                            // Pre-encode all DNS queries
+                            // Pre-encode all DNS queries and prepare for retry storage
                             let mut dns_packets: Vec<(u8, SocketAddr, Vec<u8>)> = Vec::new();
                             for (fragment_id, fragment_data) in fragments.iter().enumerate() {
                                 match codec.encode_to_dns_query(
                                     fragment_data,
-                                    domain,
+                                    &domain,
                                     packet_id,
                                     fragment_id as u8,
                                     total_fragments,
@@ -634,13 +688,26 @@ async fn main() -> Result<()> {
                                 }
                             }
                             
-                            // Send all fragments to all resolvers in parallel
-                            let sock = Arc::clone(&dns_query_socket);
-                            let send_tasks: Vec<_> = dns_packets.into_iter().map(|(frag_id, resolver, packet)| {
-                                let sock = Arc::clone(&sock);
+                            // Store pending request with pre-encoded fragments for retry
+                            let now = Instant::now();
+                            {
+                                let mut pending = pending_requests.lock().await;
+                                pending.insert(packet_id, PendingPacket {
+                                    original_source: source,
+                                    packet_id,
+                                    encoded_fragments: dns_packets.clone(),
+                                    first_sent: now,
+                                    last_sent: now,
+                                    retry_count: 0,
+                                });
+                            }
+                            
+                            // Send all fragments to all resolvers in parallel using socket pool
+                            let send_tasks: Vec<_> = dns_packets.into_iter().enumerate().map(|(i, (frag_id, resolver, packet))| {
+                                let socket = socket_pool.get(i);
                                 let total = total_fragments;
                                 tokio::spawn(async move {
-                                    match sock.send_to(&packet, resolver).await {
+                                    match socket.send_to(&packet, resolver).await {
                                         Ok(_) => {
                                             debug!("[DNS-UPLINK] Sent fragment {}/{} ({} bytes) to {}", 
                                                    frag_id + 1, total, packet.len(), resolver);
@@ -660,11 +727,11 @@ async fn main() -> Result<()> {
                                   success, total_fragments as usize * num_resolvers);
                         }
                         ResponseMode::Hybrid | ResponseMode::HybridAlias => {
-                            // Hybrid uplink: send both UDP and DNS in PARALLEL
+                            // Hybrid uplink: send both UDP and DNS in PARALLEL using socket pool
                             let num_resolvers = config.resolvers.len();
                             let mut all_tasks: Vec<tokio::task::JoinHandle<Result<(), std::io::Error>>> = Vec::new();
                             let mut udp_count = 0usize;
-                            let mut dns_count = 0usize;
+                            let mut dns_packets_for_retry: Vec<(u8, SocketAddr, Vec<u8>)> = Vec::new();
                             
                             // UDP part (faster, may be blocked) - prepare tasks
                             if let Some(server_udp) = config.server_udp_addr {
@@ -673,7 +740,6 @@ async fn main() -> Result<()> {
                                 let total_fragments_udp = fragments_udp.len() as u8;
                                 udp_count = fragments_udp.len();
                                 
-                                let sock = Arc::clone(&dns_query_socket);
                                 for (fragment_id, fragment_data) in fragments_udp.iter().enumerate() {
                                     let udp_packet = codec.encode_udp_packet(
                                         fragment_data,
@@ -682,12 +748,12 @@ async fn main() -> Result<()> {
                                         total_fragments_udp,
                                     );
                                     
-                                    let sock = Arc::clone(&sock);
+                                    let socket = socket_pool.get(fragment_id);
                                     let addr = server_udp;
                                     let frag_id = fragment_id as u8;
                                     let total = total_fragments_udp;
                                     all_tasks.push(tokio::spawn(async move {
-                                        match sock.send_to(&udp_packet, addr).await {
+                                        match socket.send_to(&udp_packet, addr).await {
                                             Ok(_) => {
                                                 debug!("[HYBRID-UPLINK] UDP fragment {}/{} to {}", frag_id + 1, total, addr);
                                                 Ok(())
@@ -707,13 +773,13 @@ async fn main() -> Result<()> {
                             let max_chunk_dns = codec.max_payload_per_query();
                             let fragments_dns = fragment_packet(data, max_chunk_dns);
                             let total_fragments_dns = fragments_dns.len() as u8;
-                            dns_count = fragments_dns.len() * num_resolvers;
+                            let dns_count = fragments_dns.len() * num_resolvers;
                             
-                            let sock = Arc::clone(&dns_query_socket);
+                            let mut task_idx = udp_count; // Continue from where UDP left off
                             for (fragment_id, fragment_data) in fragments_dns.iter().enumerate() {
                                 match codec.encode_to_dns_query(
                                     fragment_data,
-                                    domain,
+                                    &domain,
                                     packet_id,
                                     fragment_id as u8,
                                     total_fragments_dns,
@@ -729,13 +795,16 @@ async fn main() -> Result<()> {
                                         
                                         // Spawn task for each resolver (spam mode)
                                         for resolver in &config.resolvers {
-                                            let sock = Arc::clone(&sock);
+                                            dns_packets_for_retry.push((fragment_id as u8, *resolver, query_bytes.clone()));
+                                            
+                                            let socket = socket_pool.get(task_idx);
+                                            task_idx += 1;
                                             let addr = *resolver;
                                             let frag_id = fragment_id as u8;
                                             let total = total_fragments_dns;
                                             let packet = query_bytes.clone();
                                             all_tasks.push(tokio::spawn(async move {
-                                                match sock.send_to(&packet, addr).await {
+                                                match socket.send_to(&packet, addr).await {
                                                     Ok(_) => {
                                                         debug!("[HYBRID-UPLINK] DNS fragment {}/{} to {}", frag_id + 1, total, addr);
                                                         Ok(())
@@ -746,12 +815,26 @@ async fn main() -> Result<()> {
                                                     }
                                                 }
                                             }));
-                                        }
                                     }
-                                    Err(e) => {
-                                        error!("Failed to encode packet to DNS: {}", e);
-                                    }
+                            }
+                            Err(e) => {
+                                error!("Failed to encode packet to DNS: {}", e);
+                            }
                                 }
+                            }
+                            
+                            // Store pending request with pre-encoded DNS fragments for retry
+                            let now = Instant::now();
+                            {
+                                let mut pending = pending_requests.lock().await;
+                                pending.insert(packet_id, PendingPacket {
+                                    original_source: source,
+                                    packet_id,
+                                    encoded_fragments: dns_packets_for_retry,
+                                    first_sent: now,
+                                    last_sent: now,
+                                    retry_count: 0,
+                                });
                             }
                             
                             // Wait for all sends to complete in parallel
