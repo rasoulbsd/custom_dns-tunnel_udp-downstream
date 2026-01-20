@@ -165,8 +165,93 @@ async fn main() -> Result<()> {
     use std::collections::HashSet;
     let processed_response_ids: Arc<Mutex<HashSet<u16>>> = Arc::new(Mutex::new(HashSet::new()));
 
-    // Spawn task to receive DNS responses (if DNS or hybrid mode)
-    // Uses separate socket from DNS queries for better monitoring separation
+    // Spawn task to receive DNS responses on the query socket (if DNS or hybrid mode)
+    // CRITICAL: We MUST receive responses on the SAME socket we send queries from,
+    // because the server replies to the query source port. Using a separate socket
+    // causes port mismatch (server sends to query port, but we listen on response port).
+    if matches!(config.response_mode, ResponseMode::Dns | ResponseMode::Hybrid | ResponseMode::HybridAlias) {
+        let dns_query_sock_for_response = dns_query_socket.clone();
+        let codec_dns = codec.clone();
+        let reassembler_dns = reassembler.clone();
+        let pending_requests_dns = pending_requests.clone();
+        let processed_response_ids_dns = processed_response_ids.clone();
+        let udp_socket_dns = udp_socket.clone();
+        let domains = config.domains.clone();
+        
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            let query_socket_addr = dns_query_sock_for_response.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+            info!("[DNS-RESPONSE] Listening for responses on query socket: {}", query_socket_addr);
+            loop {
+                match dns_query_sock_for_response.recv_from(&mut buf).await {
+                    Ok((len, dns_source)) => {
+                        let response_data = &buf[..len];
+                        info!("[DNS-RESPONSE] Received {} bytes from {} on query socket", len, dns_source);
+                    
+                        match Message::from_bytes(response_data) {
+                            Ok(message) => {
+                                match codec_dns.decode_from_dns_response(&message, &domains) {
+                                    Ok(Some(packet)) => {
+                                        // Deduplication: skip if already processed
+                                        {
+                                            let processed = processed_response_ids_dns.lock().await;
+                                            if processed.contains(&packet.packet_id) {
+                                                debug!("[DNS-RESPONSE] Skipping packet_id {} (already processed)", packet.packet_id);
+                                                continue;
+                                            }
+                                        }
+                                        
+                                        info!("[DNS-RESPONSE] Decoded: packet_id={}, fragment={}/{}", 
+                                               packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
+                                        
+                                        let mut reass = reassembler_dns.lock().await;
+                                        if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
+                                            // Find the original source
+                                            let mut pending = pending_requests_dns.lock().await;
+                                            if let Some((original_source, _)) = pending.remove(&packet.packet_id) {
+                                                // Mark as processed
+                                                {
+                                                    let mut processed = processed_response_ids_dns.lock().await;
+                                                    processed.insert(packet.packet_id);
+                                                    if processed.len() > 1000 { processed.clear(); }
+                                                }
+                                                // Forward reassembled packet to original source
+                                                if let Err(e) = udp_socket_dns.send_to(&reassembled_data, original_source).await {
+                                                    error!("Failed to send reassembled packet: {}", e);
+                                                } else {
+                                                    info!("[DNS-RESPONSE] Sent reassembled packet {} ({} bytes) to {}", 
+                                                          packet.packet_id, reassembled_data.len(), original_source);
+                                                }
+                                            } else {
+                                                debug!("[DNS-RESPONSE] No pending request for packet_id {} (likely already handled by UDP)", packet.packet_id);
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        // Not a tunnel DNS response, ignore
+                                        debug!("[DNS-RESPONSE] Does not match tunnel format");
+                                    }
+                                    Err(e) => {
+                                        debug!("[DNS-RESPONSE] Failed to decode: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!("[DNS-RESPONSE] Failed to parse: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("[DNS-RESPONSE] Error receiving on query socket: {}", e);
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+    }
+    
+    // Also spawn task on separate dns_response_socket if it exists (for backward compatibility)
+    // But responses should primarily come through dns_query_socket
     if let Some(dns_response_sock) = dns_response_socket {
         let codec_dns = codec.clone();
         let reassembler_dns = reassembler.clone();
@@ -177,13 +262,15 @@ async fn main() -> Result<()> {
         
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
+            let response_socket_addr = dns_response_sock.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+            warn!("[DNS-RESPONSE] Also listening on separate response socket: {} (responses should come through query socket)", response_socket_addr);
             loop {
                 match dns_response_sock.recv_from(&mut buf).await {
                     Ok((len, dns_source)) => {
                         let response_data = &buf[..len];
-                        info!("[DNS-RESPONSE] Received {} bytes from {}", len, dns_source);
+                        info!("[DNS-RESPONSE] Received {} bytes from {} on separate response socket", len, dns_source);
                     
-                    match Message::from_bytes(response_data) {
+                        match Message::from_bytes(response_data) {
                         Ok(message) => {
                             match codec_dns.decode_from_dns_response(&message, &domains) {
                                 Ok(Some(packet)) => {

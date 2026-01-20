@@ -363,18 +363,32 @@ async fn main() -> Result<()> {
                             };
                             
                             if let Some((original_packet_id, client_udp_addr)) = matched {
-                                info!("Matched target response to packet_id: {}, sending to {} (mode: {:?}, plain: {})", 
-                                      original_packet_id, client_udp_addr, response_mode, plain_mode);
+                                // Get reply_addr, query_id and domain from pending_requests FIRST
+                                // CRITICAL: For DNS responses, we MUST use the actual DNS query source (with ephemeral port),
+                                // NOT the client_udp_addr from hash_map (which uses client_udp_port=53)
+                                let (reply_addr, query_id, domain) = {
+                                    let pending = pending_requests_for_response.lock().await;
+                                    if let Some((reply, qid, dom)) = pending.get(&original_packet_id) {
+                                        (*reply, *qid, dom.clone())
+                                    } else {
+                                        warn!("[TARGET] No pending request found for packet_id: {} (pending_requests keys: {:?})", original_packet_id, pending.keys().collect::<Vec<_>>());
+                                        continue;
+                                    }
+                                };
+                                
+                                info!("Matched target response to packet_id: {}, sending to reply_addr={} (client_udp_addr={}, mode: {:?}, plain: {})", 
+                                      original_packet_id, reply_addr, client_udp_addr, response_mode, plain_mode);
                                 
                                 // Plain mode: send raw UDP directly
                                 if plain_mode {
                                     let data_preview = String::from_utf8_lossy(&data[..data.len().min(10)]);
                                     info!("[PLAIN-MODE] Sending {} bytes directly to {}: {:?}", data.len(), client_udp_addr, data_preview);
                                     if let Some(ref sock) = client_response_socket {
+                                        let local_addr = sock.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
                                         if let Err(e) = sock.send_to(data, client_udp_addr).await {
-                                            error!("[PLAIN-MODE] Failed to send to {}: {}", client_udp_addr, e);
+                                            error!("[PLAIN-MODE] Failed to send to {} from {}: {}", client_udp_addr, local_addr, e);
                                         } else {
-                                            info!("[PLAIN-MODE] Sent {} bytes to {}", data.len(), client_udp_addr);
+                                            info!("[PLAIN-MODE] Sent {} bytes from {} to {}", data.len(), local_addr, client_udp_addr);
                                         }
                                     } else {
                                         warn!("[PLAIN-MODE] client_response_socket is None!");
@@ -384,20 +398,6 @@ async fn main() -> Result<()> {
                                 
                                 info!("UDP socket available: {}, DNS socket available: {}", 
                                       client_response_socket.is_some(), dns_socket_for_response.is_some());
-                                
-                                // Get reply_addr, query_id and domain from pending_requests
-                                // CRITICAL: For DNS responses, we MUST use the actual DNS query source (with ephemeral port),
-                                // NOT the client_udp_addr from hash_map (which uses client_udp_port=53)
-                                let (reply_addr, query_id, domain) = {
-                                    let pending = pending_requests_for_response.lock().await;
-                                    if let Some((reply, qid, dom)) = pending.get(&original_packet_id) {
-                                        debug!("[TARGET] Retrieved reply_addr={} for packet_id={} (query_id={}) - using this for DNS responses (NOT client_udp_addr={})", reply, original_packet_id, qid, client_udp_addr);
-                                        (*reply, *qid, dom.clone())
-                                    } else {
-                                        warn!("[TARGET] No pending request found for packet_id: {} (pending_requests keys: {:?})", original_packet_id, pending.keys().collect::<Vec<_>>());
-                                        continue;
-                                    }
-                                };
                                 
                                 // Use the ORIGINAL packet_id so client can match it
                                 let response_packet_id = original_packet_id;
@@ -474,12 +474,13 @@ async fn main() -> Result<()> {
                                                             
                                                             // IMPORTANT: reply to the DNS query source (resolver/client IP:port),
                                                             // not to client_udp_port. This is required for public resolvers to work.
-                                                            debug!("[DNS-RESPONSE] About to send to reply_addr={} (packet_id={}, fragment={}/{})", reply_addr, response_packet_id, fragment_id + 1, total_fragments);
+                                                            let local_addr = sock.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+                                                            debug!("[DNS-RESPONSE] About to send to reply_addr={} from {} (packet_id={}, fragment={}/{})", reply_addr, local_addr, response_packet_id, fragment_id + 1, total_fragments);
                                                             if let Err(e) = sock.send_to(&response_bytes, reply_addr).await {
-                                                                warn!("Failed to send DNS response to {}: {}", reply_addr, e);
+                                                                warn!("[DNS-RESPONSE] Failed to send to {} from {}: {}", reply_addr, local_addr, e);
                                                             } else {
-                                                                info!("[DNS-RESPONSE] Sent fragment {}/{} ({} bytes) to {} (domain: {})", 
-                                                                       fragment_id + 1, total_fragments, response_bytes.len(), reply_addr, spam_domain);
+                                                                info!("[DNS-RESPONSE] Sent fragment {}/{} ({} bytes) from {} to {} (domain: {})", 
+                                                                       fragment_id + 1, total_fragments, response_bytes.len(), local_addr, reply_addr, spam_domain);
                                                             }
                                                         }
                                                         Err(e) => {
@@ -557,11 +558,12 @@ async fn main() -> Result<()> {
                                                             
                                                             // IMPORTANT: reply to the DNS query source (resolver/client IP:port),
                                                             // not to client_udp_port. This is required for public resolvers to work.
+                                                            let local_addr = sock.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
                                                             if let Err(e) = sock.send_to(&response_bytes, reply_addr).await {
-                                                                warn!("Failed to send DNS response to {}: {}", reply_addr, e);
+                                                                warn!("[DNS-RESPONSE] Failed to send to {} from {}: {}", reply_addr, local_addr, e);
                                                             } else {
-                                                                debug!("[DNS-RESPONSE] Sent fragment {}/{} ({} bytes) to {} (domain: {})", 
-                                                                       fragment_id + 1, total_fragments_dns, response_bytes.len(), reply_addr, spam_domain);
+                                                                debug!("[DNS-RESPONSE] Sent fragment {}/{} ({} bytes) from {} to {} (domain: {})", 
+                                                                       fragment_id + 1, total_fragments_dns, response_bytes.len(), local_addr, reply_addr, spam_domain);
                                                             }
                                                         }
                                                         Err(e) => {
