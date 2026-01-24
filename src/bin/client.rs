@@ -3,10 +3,10 @@ use clap::Parser;
 use dns_tunnel::{
     config::{load_client_config, ResponseMode, ClientConfig, BroadcastMode},
     dns_codec::{DnsCodec, TunnelRecordType},
-    packet::{fragment_packet, PacketReassembler, NackPacket, PacketFlags},
-    session::{SessionManager, SessionPacket, SessionType, SessionFlags, SessionState},
+    packet::{fragment_packet, PacketReassembler},
+    session::{SessionManager, SessionPacket, SessionType},
     socks5::{Socks5Server, Socks5Connection, Command, ReplyCode},
-    utils::{get_random_port, rotate_resolver},
+    utils::get_random_port,
 };
 use futures::future::join_all;
 use hickory_proto::{
@@ -29,10 +29,12 @@ struct PendingPacket {
     /// Original source address (where to send response back)
     original_source: SocketAddr,
     /// Packet ID for tracking
+    #[allow(dead_code)]
     packet_id: u16,
     /// Pre-encoded fragments ready to resend (fragment_id, resolver, bytes)
     encoded_fragments: Vec<(u8, SocketAddr, Vec<u8>)>,
     /// When the packet was first sent
+    #[allow(dead_code)]
     first_sent: Instant,
     /// When the packet was last sent (for timeout calculation)
     last_sent: Instant,
@@ -104,6 +106,7 @@ impl SocketPool {
     }
     
     /// Get pool size
+    #[allow(dead_code)]
     fn size(&self) -> usize {
         self.pool_size
     }
@@ -262,7 +265,7 @@ async fn main() -> Result<()> {
         config.nack_interval_ms,
     )));
     let pending_requests: Arc<Mutex<HashMap<u16, PendingPacket>>> = Arc::new(Mutex::new(HashMap::new()));
-    let resolver_index = Arc::new(Mutex::new(0usize));
+    let _resolver_index = Arc::new(Mutex::new(0usize));
     
     // Parse configured record types for multi-record broadcast
     let record_types: Vec<TunnelRecordType> = config.record_types.iter()
@@ -1079,7 +1082,7 @@ async fn handle_socks5_client(
     codec: Arc<DnsCodec>,
     socket_pool: Arc<SocketPool>,
     server_addr: Option<SocketAddr>,
-    domains: Vec<String>,
+    _domains: Vec<String>,
 ) -> Result<()> {
     use tokio::sync::mpsc;
     
@@ -1121,7 +1124,7 @@ async fn handle_socks5_client(
             
             // For now, send success immediately (in full implementation, wait for SYN-ACK)
             // The server will establish the actual connection
-            conn.send_success(target_addr).context("Failed to send SOCKS5 success")?;
+            conn.send_success(target_addr).await.context("Failed to send SOCKS5 success")?;
             
             // Split the TCP stream for bi-directional forwarding
             let (mut read_half, mut write_half) = conn.stream.into_split();

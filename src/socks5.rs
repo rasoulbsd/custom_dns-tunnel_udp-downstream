@@ -6,9 +6,8 @@
 use std::io::{self, ErrorKind};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
-use log::{debug, info, warn, error};
+use tokio::net::{TcpListener, TcpStream};
+use log::{debug, info};
 
 /// SOCKS5 version
 pub const SOCKS5_VERSION: u8 = 0x05;

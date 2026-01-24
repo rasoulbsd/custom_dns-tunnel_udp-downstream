@@ -60,8 +60,10 @@ pub struct ClientConfig {
     /// Minimum subdomain length (default: 0, for padding/obfuscation)
     pub min_subdomain_length: usize,
     /// Enable resolver rotation
+    #[serde(default)]
     pub rotate_resolvers: bool,
     /// Randomize local UDP port
+    #[serde(default)]
     pub randomize_local_port: bool,
     /// Plain mode: send raw UDP packets directly (bypass DNS encoding) for debugging
     #[serde(default)]

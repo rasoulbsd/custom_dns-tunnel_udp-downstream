@@ -3,8 +3,8 @@ use clap::Parser;
 use dns_tunnel::{
     config::{load_server_config, ResponseMode, ServerConfig, BroadcastMode},
     dns_codec::{DnsCodec, TunnelRecordType},
-    packet::{fragment_packet, PacketReassembler, NackPacket, PacketFlags},
-    session::{SessionManager, SessionPacket, SessionType, SessionFlags, SessionState},
+    packet::{fragment_packet, PacketReassembler},
+    session::{SessionManager, SessionType},
     socks5::{Socks5Server, Socks5Connection, Command, ReplyCode},
     utils::get_random_port,
 };
@@ -390,7 +390,7 @@ async fn main() -> Result<()> {
                                 // Get reply_addr, query_id and domain from pending_requests FIRST
                                 // CRITICAL: For DNS responses, we MUST use the actual DNS query source (with ephemeral port),
                                 // NOT the client_udp_addr from hash_map (which uses client_udp_port=53)
-                                let (reply_addr, query_id, domain) = {
+                                let (reply_addr, query_id, _domain) = {
                                     let pending = pending_requests_for_response.lock().await;
                                     if let Some((reply, qid, dom)) = pending.get(&original_packet_id) {
                                         (*reply, *qid, dom.clone())
@@ -732,9 +732,9 @@ async fn main() -> Result<()> {
     // Spawn SOCKS5 server if configured (for reverse proxy functionality)
     if let Some(socks5_addr) = config.socks5_bind {
         let session_manager_socks = session_manager.clone();
-        let dns_socket_socks = dns_socket.clone();
-        let codec_socks = codec.clone();
-        let domains_socks = config.domains.clone();
+        let _dns_socket_socks = dns_socket.clone();
+        let _codec_socks = codec.clone();
+        let _domains_socks = config.domains.clone();
         
         tokio::spawn(async move {
             match Socks5Server::bind(socks5_addr).await {
@@ -992,13 +992,13 @@ async fn handle_server_socks5_client(
             // 4. Forward data bi-directionally
             
             // For now, we send success immediately (simplified)
-            conn.send_success(target_addr).context("Failed to send SOCKS5 success")?;
+            conn.send_success(target_addr).await.context("Failed to send SOCKS5 success")?;
             
             let (mut read_half, mut write_half) = conn.stream.into_split();
             
             // Read from SOCKS5 client, forward through tunnel
-            let session_id_read = session_id;
-            let session_manager_read = session_manager.clone();
+            let _session_id_read = session_id;
+            let _session_manager_read = session_manager.clone();
             
             let read_task = tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];

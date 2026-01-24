@@ -865,7 +865,7 @@ impl DnsCodec {
     fn decode_txt_response(&self, answer: &hickory_proto::rr::Record, expected_domains: &[String]) -> Result<Option<TunnelPacket>> {
         use hickory_proto::rr::RData;
         
-        if let Some(RData::TXT(txt)) = answer.data() {
+        if let Some(RData::TXT(_txt)) = answer.data() {
             let name = answer.name().to_ascii();
             let name_str = name.trim_end_matches('.');
             
@@ -899,7 +899,7 @@ impl DnsCodec {
         Ok(None)
     }
 
-    fn decode_a_response(&self, message: &Message, expected_domains: &[String]) -> Result<Option<TunnelPacket>> {
+    fn decode_a_response(&self, message: &Message, _expected_domains: &[String]) -> Result<Option<TunnelPacket>> {
         use hickory_proto::rr::RData;
         
         // Collect all A record bytes
@@ -937,7 +937,7 @@ impl DnsCodec {
         }))
     }
 
-    fn decode_aaaa_response(&self, message: &Message, expected_domains: &[String]) -> Result<Option<TunnelPacket>> {
+    fn decode_aaaa_response(&self, message: &Message, _expected_domains: &[String]) -> Result<Option<TunnelPacket>> {
         use hickory_proto::rr::RData;
         
         let mut all_bytes = Vec::new();
@@ -1018,7 +1018,7 @@ impl DnsCodec {
         use hickory_proto::rr::RData;
         
         if let Some(RData::NULL(null_data)) = answer.data() {
-            let data = null_data.anything().map(|d| d.to_vec()).unwrap_or_default();
+            let data = null_data.anything().to_vec();
             if data.len() < 4 {
                 return Ok(None);
             }
