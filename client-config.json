@@ -1,9 +1,9 @@
 {
-  "local_udp": "127.0.0.1:5358",
-  "domains": ["your-domain.com"],
-  "resolvers": ["127.0.0.1:5553"],
+  "local_udp": "127.0.0.1:5354",
+  "domains": ["a22.payandehiran.xyz"],
+  "resolvers": ["1.1.1.1:53"],
   "resolver_profiles": [
-    {"addr": "127.0.0.1:5553", "max_subdomain_length": 63, "max_labels": 4, "weight": 100}
+    {"addr": "1.1.1.1:53", "max_subdomain_length": 63, "max_labels": 4, "weight": 100}
   ],
   "max_subdomain_length": 101,
   "min_subdomain_length": 50,
