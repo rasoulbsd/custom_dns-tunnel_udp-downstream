@@ -1,15 +1,11 @@
 {
-  "dns_bind": "0.0.0.0:53533",
-  "udp_query_port": 5354,
-  "target_udp": "127.0.0.1:8080",
-  "client_udp_port": 5355,
-  "response_mode": "udp/dns",
-  "domains": [
-    "example.com",
-    "us.meonme.ir"
-  ],
-  "max_subdomain_length": 100,
-  "min_subdomain_length": 60,
+  "dns_bind": "0.0.0.0:5553",
+  "target_udp": "127.0.0.1:1234",
+  "client_udp_port": 5358,
+  "domains": ["your-domain.com"],
+  "response_mode": "dns",
+  "max_subdomain_length": 101,
+  "min_subdomain_length": 50,
   "randomize_dns_port": false,
-  "plain_mode": false
+  "fec": {"enabled": true, "data_shards": 10, "parity_shards": 2}
 }

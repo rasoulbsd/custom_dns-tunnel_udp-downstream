@@ -1,0 +1,60 @@
+{
+  "_comment": "=== Complete Client Configuration ===",
+
+  "local_udp": "127.0.0.1:5353",
+  "response_udp_port": null,
+  "server_udp_addr": null,
+
+  "uplink_mode": "dns",
+  "response_mode": "udp",
+
+  "domains": ["your-domain.com"],
+
+  "resolvers": ["8.8.8.8:53", "1.1.1.1:53"],
+
+  "resolver_profiles": [
+    {
+      "addr": "8.8.8.8:53",
+      "max_subdomain_length": 63,
+      "min_subdomain_length": 0,
+      "max_labels": 4,
+      "enabled": true,
+      "weight": 100
+    },
+    {
+      "addr": "1.1.1.1:53",
+      "max_subdomain_length": 50,
+      "min_subdomain_length": 0,
+      "max_labels": 3,
+      "enabled": true,
+      "weight": 80
+    }
+  ],
+
+  "max_subdomain_length": 63,
+  "min_subdomain_length": 0,
+  "rotate_resolvers": true,
+  "randomize_local_port": false,
+  "plain_mode": false,
+
+  "retry_timeout_ms": 100,
+  "max_retries": 10,
+  "query_socket_pool_size": 5,
+
+  "fec": {
+    "enabled": false,
+    "data_shards": 10,
+    "parity_shards": 2
+  },
+
+  "kcp": {
+    "enabled": false,
+    "nodelay": 1,
+    "interval": 10,
+    "resend": 2,
+    "nc": 1,
+    "mtu": 100,
+    "sndwnd": 128,
+    "rcvwnd": 128
+  }
+}

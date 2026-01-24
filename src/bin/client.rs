@@ -419,13 +419,6 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 
-                // #region agent log
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/.cursor/debug.log") {
-                    let _ = writeln!(f, r#"{{"hypothesisId":"C","location":"client.rs:257","message":"packet_received","data":{{"source":"{}","len":{},"first_bytes":"{:?}"}},"timestamp":{}}}"#, source, len, &data[..len.min(8)], std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-                }
-                // #endregion
-                
                 // Check if this is a UDP response from server or a local UDP packet
                 // Server responses will be UDP packets with our tunnel format (4-byte header)
                 // Local UDP packets from applications won't have this format
@@ -451,12 +444,6 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                         }
-                        
-                        // #region agent log
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/.cursor/debug.log") {
-                            let _ = writeln!(f, r#"{{"hypothesisId":"A","location":"client.rs:280","message":"udp_tunnel_decoded","data":{{"packet_id":{},"fragment":{},"total":{}}},"timestamp":{}}}"#, packet.packet_id, packet.fragment_id, packet.total_fragments, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-                        }
-                        // #endregion
                         
                         // Check if packet_id is in pending requests
                         let mut pending = pending_requests.lock().await;
@@ -498,36 +485,15 @@ async fn main() -> Result<()> {
                     }
                 } else {
                     // Not a UDP tunnel packet
-                    // #region agent log
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/.cursor/debug.log") {
-                        let _ = writeln!(f, r#"{{"hypothesisId":"B","location":"client.rs:312","message":"not_udp_tunnel","data":{{"source":"{}","len":{}}},"timestamp":{}}}"#, source, len, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-                    }
-                    // #endregion
-                    
                     // First, try to parse as DNS response (regardless of source)
                     // This is the most reliable way to detect DNS responses
                     let dns_parse_result = Message::from_bytes(data);
-                    // #region agent log
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/.cursor/debug.log") {
-                        let _ = writeln!(f, r#"{{"hypothesisId":"D","location":"client.rs:320","message":"dns_parse_attempt","data":{{"success":{},"source":"{}"}},"timestamp":{}}}"#, dns_parse_result.is_ok(), source, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-                    }
-                    // #endregion
                     if let Ok(message) = dns_parse_result {
                         let decode_result = codec.decode_from_dns_response(&message, &config.domains);
-                        // #region agent log
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/.cursor/debug.log") {
-                            let _ = writeln!(f, r#"{{"hypothesisId":"D","location":"client.rs:326","message":"dns_decode_result","data":{{"result":"{:?}"}},"timestamp":{}}}"#, decode_result.as_ref().map(|o| o.is_some()), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-                        }
-                        // #endregion
                         if let Ok(Some(packet)) = decode_result {
                             // Deduplication: skip if already processed
                             {
                                 let processed = processed_response_ids.lock().await;
-                                // #region agent log
-                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/.cursor/debug.log") {
-                                    let _ = writeln!(f, r#"{{"hypothesisId":"DEDUP","location":"client.rs:dns_main","message":"dedup_check","data":{{"packet_id":{},"is_processed":{},"set_size":{}}},"timestamp":{}}}"#, packet.packet_id, processed.contains(&packet.packet_id), processed.len(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-                                }
-                                // #endregion
                                 if processed.contains(&packet.packet_id) {
                                     info!("[DNS-RESPONSE] Skipping packet_id {} (already processed)", packet.packet_id);
                                     continue;

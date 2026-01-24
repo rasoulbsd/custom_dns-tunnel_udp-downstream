@@ -1,0 +1,34 @@
+{
+  "_comment": "=== Complete Server Configuration ===",
+
+  "dns_bind": "0.0.0.0:53",
+  "udp_query_port": 5354,
+  "target_udp": "127.0.0.1:1234",
+  "client_udp_port": 5353,
+
+  "response_mode": "udp",
+
+  "domains": ["your-domain.com"],
+
+  "max_subdomain_length": 63,
+  "min_subdomain_length": 0,
+  "randomize_dns_port": false,
+  "plain_mode": false,
+
+  "fec": {
+    "enabled": false,
+    "data_shards": 10,
+    "parity_shards": 2
+  },
+
+  "kcp": {
+    "enabled": false,
+    "nodelay": 1,
+    "interval": 10,
+    "resend": 2,
+    "nc": 1,
+    "mtu": 100,
+    "sndwnd": 128,
+    "rcvwnd": 128
+  }
+}
