@@ -20,6 +20,36 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use serde_json::json;
+use std::fs::OpenOptions;
+use std::io::Write;
+
+fn log_debug(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    // #region agent log
+    let payload = json!({
+        "sessionId": "debug-session",
+        "runId": "run2",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    });
+    let paths = [
+        "/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/custom_dns-tunnel_udp-downstream/.cursor/debug.log",
+        "c:\\Users\\rasoo\\Desktop\\Github\\dns-tunnel\\custom_dns-tunnel_udp-downstream\\.cursor\\debug.log",
+    ];
+    for path in paths {
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{}", payload.to_string());
+            break;
+        }
+    }
+    // #endregion
+}
 
 #[derive(Parser)]
 #[command(name = "dns-tunnel-server")]
@@ -90,6 +120,17 @@ async fn main() -> Result<()> {
 
     info!("Starting DNS Tunnel Server");
     info!("DNS bind: {}", dns_bind);
+    // #region agent log
+    log_debug("A", "server.rs:config_snapshot", "server_config", json!({
+        "dns_bind": dns_bind.to_string(),
+        "target_udp": format!("{:?}", target_udp),
+        "client_udp_port": config.client_udp_port,
+        "domains": config.domains.clone(),
+        "response_mode": format!("{:?}", config.response_mode),
+        "max_subdomain_length": config.max_subdomain_length,
+        "min_subdomain_length": config.min_subdomain_length
+    }));
+    // #endregion
     info!("Target UDP: {:?}", target_udp);
     info!("Client UDP port: {:?}", config.client_udp_port);
     info!("Domains: {:?}", config.domains);
@@ -533,6 +574,14 @@ async fn main() -> Result<()> {
                                             let success = results.iter().filter(|r| r.is_ok() && r.as_ref().unwrap().is_ok()).count();
                                             info!("[DNS-RESPONSE] Sent {}/{} packets successfully (parallel spam)", 
                                                   success, total_fragments as usize * domains_for_response.len());
+                                            // #region agent log
+                                            log_debug("A", "server.rs:dns_response_sent", "dns_response_sent", json!({
+                                                "packet_id": response_packet_id,
+                                                "reply_addr": reply_addr.to_string(),
+                                                "success": success,
+                                                "total": total_fragments as usize * domains_for_response.len()
+                                            }));
+                                            // #endregion
                                         }
                                     }
                                     ResponseMode::Hybrid | ResponseMode::HybridAlias => {
@@ -720,6 +769,14 @@ async fn main() -> Result<()> {
                                 
                                 info!("[DNS-QUERY] Decoded from {}: packet_id={}, fragment={}/{}", 
                                        dns_source, packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
+                                // #region agent log
+                                log_debug("A", "server.rs:dns_query_decoded", "dns_query_decoded", json!({
+                                    "source": dns_source.to_string(),
+                                    "packet_id": packet.packet_id,
+                                    "fragment_id": packet.fragment_id,
+                                    "total_fragments": packet.total_fragments
+                                }));
+                                // #endregion
 
                                 // Extract domain from query for DNS responses
                                 let domain = if let Some(query) = message.queries().first() {

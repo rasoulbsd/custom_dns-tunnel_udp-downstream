@@ -4,7 +4,7 @@ use dns_tunnel::{
     config::{load_client_config, ResponseMode, ClientConfig},
     dns_codec::DnsCodec,
     packet::{fragment_packet, PacketReassembler},
-    utils::{get_random_port, rotate_resolver},
+    utils::get_random_port,
 };
 use futures::future::join_all;
 use hickory_proto::{
@@ -13,12 +13,43 @@ use hickory_proto::{
 };
 use log::{debug, error, info, warn};
 use rand::Rng;
+use serde_json::json;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
+
+fn log_debug(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    // #region agent log
+    let payload = json!({
+        "sessionId": "debug-session",
+        "runId": "run2",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    });
+    // Try both Windows and WSL paths
+    let paths = [
+        "/mnt/c/Users/rasoo/Desktop/Github/dns-tunnel/custom_dns-tunnel_udp-downstream/.cursor/debug.log",
+        "c:\\Users\\rasoo\\Desktop\\Github\\dns-tunnel\\custom_dns-tunnel_udp-downstream\\.cursor\\debug.log",
+    ];
+    for path in paths {
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{}", payload.to_string());
+            break;
+        }
+    }
+    // #endregion
+}
 
 /// Pending packet info for retry mechanism
 #[derive(Clone)]
@@ -184,6 +215,24 @@ async fn main() -> Result<()> {
     info!("Uplink mode: {:?} (how client sends to server)", config.uplink_mode);
     info!("Response mode: {:?} (what responses client listens for)", config.response_mode);
     info!("Resolver rotation: {}", config.rotate_resolvers);
+    // #region agent log
+    log_debug(
+        "A",
+        "client.rs:config_snapshot",
+        "config_snapshot",
+        json!({
+            "domains": config.domains.clone(),
+            "resolvers": config.resolvers.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+            "min_subdomain_length": config.min_subdomain_length,
+            "max_subdomain_length": config.max_subdomain_length,
+            "response_mode": format!("{:?}", config.response_mode),
+            "uplink_mode": format!("{:?}", config.uplink_mode),
+            "retry_timeout_ms": config.retry_timeout_ms,
+            "max_retries": config.max_retries,
+            "local_udp": local_udp.to_string()
+        }),
+    );
+    // #endregion
 
     if config.domains.is_empty() {
         anyhow::bail!("At least one domain must be specified");
@@ -210,7 +259,8 @@ async fn main() -> Result<()> {
     let codec = Arc::new(DnsCodec::new_with_min(config.max_subdomain_length, config.min_subdomain_length));
     let reassembler = Arc::new(Mutex::new(PacketReassembler::new()));
     let pending_requests: Arc<Mutex<HashMap<u16, PendingPacket>>> = Arc::new(Mutex::new(HashMap::new()));
-    let resolver_index = Arc::new(Mutex::new(0usize));
+    let send_times: Arc<Mutex<HashMap<u16, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+    let _resolver_index = Arc::new(Mutex::new(0usize));
     
     // Retry configuration
     let retry_timeout_ms = config.retry_timeout_ms.unwrap_or(100);
@@ -235,6 +285,7 @@ async fn main() -> Result<()> {
             let processed_response_ids_dns = processed_response_ids.clone();
             let udp_socket_dns = udp_socket.clone();
             let domains = config.domains.clone();
+            let send_times_dns = send_times.clone();
             
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];
@@ -261,6 +312,14 @@ async fn main() -> Result<()> {
                                             
                                             info!("[DNS-RESPONSE] Decoded: packet_id={}, fragment={}/{}", 
                                                    packet.packet_id, packet.fragment_id + 1, packet.total_fragments);
+                                            // #region agent log
+                                            log_debug("B", "client.rs:dns_response_recv", "dns_response_recv", json!({
+                                                "packet_id": packet.packet_id,
+                                                "fragment_id": packet.fragment_id,
+                                                "total_fragments": packet.total_fragments,
+                                                "socket_idx": socket_idx
+                                            }));
+                                            // #endregion
                                             
                                             let mut reass = reassembler_dns.lock().await;
                                             if let Some(reassembled_data) = reass.add_fragment(packet.clone()) {
@@ -279,9 +338,39 @@ async fn main() -> Result<()> {
                                                     } else {
                                                         info!("[DNS-RESPONSE] Sent reassembled packet {} ({} bytes) to {}", 
                                                               packet.packet_id, reassembled_data.len(), pending_pkt.original_source);
+                                                        // #region agent log
+                                                        log_debug("B", "client.rs:response_sent", "response_sent", json!({
+                                                            "packet_id": packet.packet_id,
+                                                            "len": reassembled_data.len(),
+                                                            "dest": pending_pkt.original_source.to_string()
+                                                        }));
+                                                        // #endregion
+                                                    }
+                                                    // Log response latency
+                                                    if let Some(sent_at) = send_times_dns.lock().await.remove(&packet.packet_id) {
+                                                        let latency_ms = sent_at.elapsed().as_millis();
+                                                        // #region agent log
+                                                        log_debug(
+                                                            "B",
+                                                            "client.rs:dns_response_latency",
+                                                            "dns_response_latency",
+                                                            json!({
+                                                                "packet_id": packet.packet_id,
+                                                                "latency_ms": latency_ms
+                                                            }),
+                                                        );
+                                                        // #endregion
                                                     }
                                                 } else {
                                                     debug!("[DNS-RESPONSE] No pending request for packet_id {} (likely already handled)", packet.packet_id);
+                                                    log_debug(
+                                                        "H",
+                                                        "client.rs:dns_response_missing_pending",
+                                                        "dns_response_missing_pending",
+                                                        json!({
+                                                            "packet_id": packet.packet_id
+                                                        }),
+                                                    );
                                                 }
                                             }
                                         }
@@ -325,10 +414,12 @@ async fn main() -> Result<()> {
                 let now = Instant::now();
                 let mut packets_to_retry: Vec<(u16, PendingPacket)> = Vec::new();
                 let mut packets_to_remove: Vec<u16> = Vec::new();
+                let max_pending_age = Duration::from_secs(30);
                 
                 // Find timed-out packets
                 {
                     let mut pending = pending_requests_retry.lock().await;
+                    let pending_len = pending.len();
                     for (packet_id, pkt) in pending.iter_mut() {
                         // Skip if already processed
                         {
@@ -340,10 +431,29 @@ async fn main() -> Result<()> {
                         }
                         
                         // Check if timed out
-                        if now.duration_since(pkt.last_sent) >= retry_timeout {
+                        if now.duration_since(pkt.first_sent) > max_pending_age {
+                            warn!("[RETRY] Packet {} exceeded max pending age (30s), removing", packet_id);
+                            packets_to_remove.push(*packet_id);
+                            continue;
+                        }
+
+                            if now.duration_since(pkt.last_sent) >= retry_timeout {
                             if pkt.retry_count >= max_retries {
-                                warn!("[RETRY] Packet {} exceeded max retries ({}), giving up", packet_id, max_retries);
-                                packets_to_remove.push(*packet_id);
+                                warn!("[RETRY] Packet {} exceeded max retries ({}), waiting for late response", packet_id, max_retries);
+                                log_debug(
+                                    "I",
+                                    "client.rs:retry_exceeded",
+                                    "retry_exceeded_waiting",
+                                    json!({
+                                        "packet_id": packet_id,
+                                        "retry_count": pkt.retry_count,
+                                        "max_retries": max_retries,
+                                        "pending_len": pending_len
+                                    }),
+                                );
+                                // Stop resending but keep pending so late DNS responses can be accepted.
+                                // Bump last_sent to avoid tight loop.
+                                pkt.last_sent = now;
                             } else {
                                 // Mark for retry
                                 pkt.retry_count += 1;
@@ -542,6 +652,13 @@ async fn main() -> Result<()> {
                     // This is a local UDP packet from an application
                     let data_preview = String::from_utf8_lossy(&data[..data.len().min(10)]);
                     info!("[UDP-LOCAL] Received {} bytes from application {}: {:?}", len, source, data_preview);
+                    // #region agent log
+                    log_debug("C", "client.rs:udp_local_recv", "udp_local_recv", json!({
+                        "len": len,
+                        "source": source.to_string(),
+                        "preview": data_preview
+                    }));
+                    // #endregion
 
                     // Plain mode: send raw UDP directly
                     if config.plain_mode {
@@ -562,6 +679,19 @@ async fn main() -> Result<()> {
                     // Generate packet ID
                     let packet_id = packet_id_counter;
                     packet_id_counter = packet_id_counter.wrapping_add(1);
+                    {
+                        let mut times = send_times.lock().await;
+                        times.insert(packet_id, Instant::now());
+                    }
+                    log_debug(
+                        "H",
+                        "client.rs:udp_local_sendtime",
+                        "udp_local_sendtime",
+                        json!({
+                            "packet_id": packet_id,
+                            "len": len
+                        }),
+                    );
 
                     // Select domain for DNS queries
                     let domain = config.domains[rand::thread_rng().gen_range(0..config.domains.len())].clone();
@@ -666,7 +796,26 @@ async fn main() -> Result<()> {
                                     last_sent: now,
                                     retry_count: 0,
                                 });
+                                log_debug(
+                                    "H",
+                                    "client.rs:pending_insert",
+                                    "pending_insert",
+                                    json!({
+                                        "packet_id": packet_id,
+                                        "pending_len": pending.len()
+                                    }),
+                                );
                             }
+                            log_debug(
+                                "J",
+                                "client.rs:dns_send_targets",
+                                "dns_send_targets",
+                                json!({
+                                    "packet_id": packet_id,
+                                    "dns_packets": dns_packets.len(),
+                                    "resolvers": config.resolvers.iter().map(|r| r.to_string()).collect::<Vec<_>>()
+                                }),
+                            );
                             
                             // Send all fragments to all resolvers in parallel using socket pool
                             let send_tasks: Vec<_> = dns_packets.into_iter().enumerate().map(|(i, (frag_id, resolver, packet))| {

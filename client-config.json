@@ -1,16 +1,18 @@
 {
-  "local_udp": "127.0.0.1:5354",
+  "local_udp": "127.0.0.1:5358",
   "domains": ["a22.payandehiran.xyz"],
   "resolvers": ["1.1.1.1:53"],
   "resolver_profiles": [
     {"addr": "1.1.1.1:53", "max_subdomain_length": 63, "max_labels": 4, "weight": 100}
   ],
-  "max_subdomain_length": 101,
-  "min_subdomain_length": 50,
+  "max_subdomain_length": 63,
+  "min_subdomain_length": 10,
   "uplink_mode": "dns",
   "response_mode": "dns",
-  "fec": {"enabled": true, "data_shards": 10, "parity_shards": 2},
-  "kcp": {"enabled": true},
+  "retry_timeout_ms": 2000,
+  "max_retries": 5,
+  "fec": {"enabled": false},
+  "kcp": {"enabled": false},
   "rotate_resolvers": true,
   "randomize_local_port": false
 }

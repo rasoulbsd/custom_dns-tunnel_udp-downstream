@@ -2,10 +2,10 @@
   "dns_bind": "0.0.0.0:5553",
   "target_udp": "127.0.0.1:1234",
   "client_udp_port": 5358,
-  "domains": ["your-domain.com"],
+  "domains": ["a22.payandehiran.xyz"],
   "response_mode": "dns",
-  "max_subdomain_length": 101,
-  "min_subdomain_length": 50,
+  "max_subdomain_length": 63,
+  "min_subdomain_length": 10,
   "randomize_dns_port": false,
   "fec": {"enabled": true, "data_shards": 10, "parity_shards": 2}
 }
