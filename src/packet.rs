@@ -16,7 +16,8 @@ pub struct TunnelPacket {
 
 #[derive(Debug)]
 pub struct PacketReassembler {
-    fragments: HashMap<(SocketAddr, SocketAddr, u16), HashMap<u8, (Vec<u8>, Instant)>>,
+    // Key is just packet_id since source/dest are placeholders (0.0.0.0:0)
+    fragments: HashMap<u16, HashMap<u8, (Vec<u8>, Instant)>>,
 }
 
 impl PacketReassembler {
@@ -27,7 +28,7 @@ impl PacketReassembler {
     }
 
     pub fn add_fragment(&mut self, packet: TunnelPacket) -> Option<Vec<u8>> {
-        let key = (packet.source, packet.destination, packet.packet_id);
+        let key = packet.packet_id;
         
         // Clean up old fragments
         self.cleanup();
